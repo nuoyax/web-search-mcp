@@ -1,221 +1,352 @@
 # web-search MCP server
 
-自建 Web 搜索 MCP server。多引擎（国内直连 + 国际自动走代理），三个工具：`web_search` / `fetch_url` / `deep_research`。融合排序、近似去重、每主机限速退避、结果缓存、TLS 指纹伪装等均基于国际论文实现。
+[![MCP](https://img.shields.io/badge/MCP-server-blue)](https://modelcontextprotocol.io)
+[![Node](https://img.shields.io/badge/Node-%3E%3D18-green)](https://nodejs.org)
+[![License](https://img.shields.io/badge/license-MIT-brightgreen)](#license)
 
-- 实现：Node.js + `@modelcontextprotocol/sdk`，stdio 传输
-- 代理：国际引擎/站点走 `127.0.0.1:7890`，国内引擎直连，按域名自动分流
-- 缓存：磁盘 KV，按站点更新频率设 TTL（30min/1h/7d），命中直接返回
-- TLS 伪装：403/强风控站点降级到 `curl_cffi` 伪造浏览器 JA3（需 Python）
-- [English](./README.en.md)
+A self-hosted **web search MCP server** for Claude Code / any MCP client. Multi-engine (CN-direct + international-via-proxy auto-routing), three tools, and research-backed optimizations: RRF rank fusion, SimHash near-duplicate dedup, per-host rate limiting, frequency-aware caching, and TLS/JA3 fingerprint impersonation fallback.
 
----
-
-## 架构图
-
-![Architecture](docs/architecture.png)
-
-### `deep_research` 流水线
-
-![Pipeline](docs/pipeline.png)
+[中文文档](./README.zh.md)
 
 ---
 
-## 原理
+## Highlights
 
-### 1. 代理自动路由（CN 直连 / 国际走代理）
+- **6 engines** — DuckDuckGo / Bing (international, via proxy) + Bing CN / Baidu / Sogou / 360 (direct). Auto-selected by query language.
+- **3 tools** — `web_search`, `fetch_url`, `deep_research` (multi-engine fan-out → dedup → rank → fetch → cited report)
+- **Auto proxy routing** — CN hosts go direct, international hosts go through `127.0.0.1:7890`; re-decided per redirect hop.
+- **RRF rank fusion** (`k=60`) across engines — robust without score normalization.
+- **SimHash dedup** — 64-bit, Hamming ≤ 3, merges syndicated copies across hosts.
+- **Per-host token bucket + exponential backoff** — defeats frequency-based anti-bot detection.
+- **Disk cache** with frequency-aware TTL (search 30 min / news 1 h / docs 7 d).
+- **TLS/JA3 impersonation** via `curl_cffi` for Cloudflare-protected sites (e.g. `docs.anthropic.com`).
 
-`src/http.js` 维护国内域名后缀表（`baidu.com` / `bing.com` / `so.com` 等）。请求时按主机名后缀判定：
+---
 
-- 命中国内域名 → 直连（走代理反而更慢、且易被国内站风控）
-- 国际域名 → 走 `127.0.0.1:7890` 代理（绕过宿主机境外网络问题）
-- 重定向时**逐跳重新判定**：国际站 301 到国内 CDN 不会继续走代理
-- `engine.search()` 也可用 `forceProxy` / `forceDirect` 强制覆盖（如 DuckDuckGo 必须走代理）
-- 设 `PROXY_URL=""` 可禁用代理（如已开全局 VPN）
+## Architecture
 
-### 2. RRF 融合排序（Reciprocal Rank Fusion）
+```mermaid
+flowchart TB
+    Client["Claude Code / MCP Client\n(stdio · JSON-RPC)"]
 
-`src/research.js`。每条结果得分 = Σ_engine `1/(k + rankᵢ)`，`k=60`。
+    subgraph Server["web-search MCP Server  (index.js)"]
+        T1["web_search"]
+        T2["fetch_url"]
+        T3["deep_research"]
+        Cache["cache.js\n disk KV · frequency-aware TTL"]
+    end
 
-- **无监督**：无需分数归一化，对引擎结果数不均鲁棒
-- **多引擎共识**：出现在多个引擎且排名靠前的结果自然排前
-- query 词命中标题仅作 1e-4 量级 tiebreaker，不覆盖跨引擎共识
-- k=60 是 Cormack et al. (2009) 与 ranx.fuse 的标准默认值
+    subgraph Core["Core layer"]
+        Eng["engines.js\n6 engine adapters"]
+        Fetch["fetcher.js\nHTML → markdown\n+ TLS fallback dispatch"]
+        Res["research.js\nRRF fusion + SimHash dedup"]
+    end
 
-### 3. SimHash 近似去重
+    subgraph HTTP["http.js  (undici primary path)"]
+        Proxy["Proxy routing\nCN direct / Intl → 7890\nre-routed per hop"]
+        Bucket["Token bucket\n1 concurrent / host\n+120ms interval"]
+        Backoff["Exponential backoff\n429 / 5xx retry\n+ Retry-After"]
+        Undici["decompress interceptor\n+ manual 3xx loop"]
+        Sim["simhash.js\n64-bit Charikar near-dup"]
+    end
 
-`src/simhash.js`。64-bit SimHash（Charikar 算法），分词用 FNV-1a 哈希 + unigram/bigram。
+    TLS["tlsbypass.js → curl_cffi (Python)\nbrowser JA3/JA4 impersonation"]
 
-- 两阶段：先精确 URL 合并，再 SimHash 汉明距离 ≤3 视为近似重复
-- 指纹**不含 host**：专门合并跨主机转载（同一新闻被不同门户转载、百度/Bing 同一结果不同 URL 包装）
-- 验证：同文不同 host 距离 0，改写后距离 11，无关内容距离 36——区分有效
+    CN["CN engines (direct)\nbaidu · bingcn · sogou · so"]
+    Intl["International engines (proxy 127.0.0.1:7890)\nduckduckgo · bing"]
 
-### 4. 每主机令牌桶 + 指数退避（抗频繁访问检测）
+    Client <--> Server
+    T1 --> Core
+    T2 --> Core
+    T3 --> Core
+    T1 -.cache.-> Cache
+    T2 -.cache.-> Cache
+    T3 -.cache.-> Cache
+    Core --> HTTP
+    HTTP -- "403 / 429\nor hard-case host" --> TLS
+    HTTP --> CN
+    HTTP --> Intl
+```
 
-`src/http.js`。每主机：
+### `deep_research` pipeline
 
-- 并发 1 + 请求间隔 ≥120ms（`HOST_BUCKETS`）
-- 瞬时错误（429/502/503/504）+ 网络异常：指数退避 `500·2^attempt + 随机抖动`，最多 2 次
-- 尊重 `Retry-After` 响应头
-- 异主机仍并行（不牺牲吞吐）
+```mermaid
+flowchart TB
+    Q(["query"]) --> S1["1. Engine selection\nCJK → CN first · Latin → Intl first\nor engines=[...] / all"]
+    S1 --> S2["2. Fan-out search\nall engines in parallel · fault-tolerant"]
+    S2 --> S3["3. Baidu redirect resolution\nbaidu.com/link?url= → real URL"]
+    S3 --> S4["4. Two-stage dedup\nstage 1: exact URL · stage 2: SimHash Hamming ≤ 3"]
+    S4 --> S5["5. RRF ranking\nscore = Σ 1/(60 + rank)"]
+    S5 --> S6["6. Fetch top-K\nmax 4 concurrent · token bucket + backoff\nTLS → curl_cffi on 403"]
+    S6 --> S7["7. Synthesize report\ncited markdown"]
+    S7 --> R(["cited report"])
+```
 
-直接对应"频繁访问检测"主因——同主机高频请求。
+---
 
-### 5. 结果缓存 + 频率感知 TTL（增量）
+## Principles
 
-`src/cache.js`。磁盘 JSON KV，按站点更新频率设 TTL：
+### 1. Auto proxy routing (CN direct / international via proxy)
 
-| 站点类型 | TTL | 依据 |
+`src/http.js` keeps a list of CN-domain suffixes (`baidu.com` / `bing.com` / `so.com` …). On each request the host suffix decides:
+
+- CN domain hit → direct (proxying CN sites is slower and trips their risk control)
+- International host → through `127.0.0.1:7890` (works around host-network issues reaching foreign sites)
+- On redirect, **the route is re-decided per hop**: a 301 from an international site to a CN CDN stops using the proxy
+- `engine.search()` may override with `forceProxy` / `forceDirect` (e.g. DuckDuckGo must be proxied)
+- Set `PROXY_URL=""` to disable the proxy (e.g. when a global VPN is active)
+
+### 2. RRF rank fusion (Reciprocal Rank Fusion)
+
+`src/research.js`. Each result's score = Σ_engine `1/(k + rankᵢ)`, with `k=60`.
+
+- **Unsupervised**: no score normalization needed; robust to engines returning different counts
+- **Cross-engine consensus**: results that appear in multiple engines near the top naturally surface
+- Query-term-in-title is only a 1e-4-scale tiebreaker; it never overrides cross-engine consensus
+- `k=60` is the standard default from Cormack et al. (2009) and ranx.fuse
+
+### 3. SimHash near-duplicate dedup
+
+`src/simhash.js`. 64-bit SimHash (Charikar), tokenized with FNV-1a hashing + unigram/bigram.
+
+- Two stages: exact normalized-URL merge first, then SimHash Hamming ≤ 3 as near-duplicate
+- The fingerprint **excludes the host**, so syndicated copies across different hosts merge (the same article republished by different portals, or the same result wrapped differently by Baidu vs Bing)
+- Verified: identical text under different hosts → distance 0; reworded → 11; unrelated → 36 — discriminative
+
+### 4. Per-host token bucket + exponential backoff (anti frequent-access detection)
+
+`src/http.js`. Per host:
+
+- Concurrency 1 + ≥120 ms between requests (`HOST_BUCKETS`)
+- Transient errors (429/502/503/504) + network failures: exponential backoff `500·2^attempt + jitter`, up to 2 retries
+- Honors the `Retry-After` response header
+- Different hosts still run in parallel (no throughput loss)
+
+This directly targets the main cause of "frequent-access detection" — high request rate to a single host.
+
+### 5. Result caching + frequency-aware TTL (incremental)
+
+`src/cache.js`. Disk JSON KV with TTLs scaled by site update frequency:
+
+| Site category | TTL | Rationale |
 |---|---|---|
-| 搜索引擎结果页（baidu/bing/ddg…） | 30 min | 结果排序变动快 |
-| 新闻聚合（163/sina/cctv/reuters…） | 1 h | 高频更新 |
-| 文档/API/百科（docs./wikipedia/arxiv…） | 7 d | 内容稳定 |
-| 其他 | 6 h | 默认 |
+| Search-engine result pages (baidu/bing/ddg…) | 30 min | result ordering shifts fast |
+| News aggregators (163/sina/cctv/reuters…) | 1 h | high-churn |
+| Docs/API/encyclopedia (docs./wikipedia/arxiv…) | 7 d | stable content |
+| Other | 6 h | default |
 
-- `web_search` / `fetch_url` / `deep_research` 命中缓存直接返回（带 `_cached (age Nmin, ttl Mmin)_` 标记）
-- 仅在有结果时缓存（空结果不缓存，下次重试）
-- 设 `CACHE_DISABLED=1` 可禁用；`CACHE_DIR` 可改缓存目录
-- 依据：频率感知增量爬取（2010）——按页面更新频率决定刷新间隔
+- `web_search` / `fetch_url` / `deep_research` return cached results on hit (tagged `_cached (age Nmin, ttl Mmin)_`)
+- Only caches when there are results (empty results aren't cached, so the next call retries)
+- `CACHE_DISABLED=1` disables; `CACHE_DIR` overrides the cache directory
+- Rationale: frequency-aware incremental crawling (2010) — refresh interval scaled by page change frequency
 
-### 6. TLS/JA3 指纹伪装降级（curl_cffi）
+### 6. TLS/JA3 fingerprint impersonation fallback (curl_cffi)
 
-`src/tlsbypass.js` + `src/fetcher.js`。Node undici 的 TLS ClientHello 与真实浏览器不同，强风控站点（Cloudflare 保护的 `docs.anthropic.com` 等）会返回 403。`curl_cffi`（Python）可伪装浏览器 JA3/JA4 指纹 + HTTP/2 设置。
+`src/tlsbypass.js` + `src/fetcher.js`. Node undici's TLS ClientHello differs from a real browser, so heavily-protected sites (Cloudflare-protected `docs.anthropic.com` etc.) return 403. `curl_cffi` (Python) can impersonate a real browser's JA3/JA4 fingerprint + HTTP/2 settings.
 
-策略：
-- **快路径**：默认用 undici（快、原生）
-- **已知硬骨头站点**（`docs/platform.anthropic.com` 等）：直接走 curl_cffi
-- **通用降级**：undici 遇 403/429 或网络异常 → 自动降级到 curl_cffi 重试；都失败则如实报错（含 `impersonated` 标记）
-- 报告里标注 `TLS: impersonated (curl_cffi)` 或 `native (undici)`
-- 需 Python + `pip install curl_cffi`；未装时降级为纯 undici（不影响主流程）
-- 依据：TLS Beyond the Browser（ACM IMC 2019）——非浏览器 TLS 客户端可被指纹识别，伪装可弥合
+Strategy:
 
-### 7. 引擎适配
+- **Fast path**: undici by default (fast, native)
+- **Known hard-case hosts** (`docs/platform.anthropic.com` etc.): go straight to curl_cffi
+- **Generic fallback**: on undici 403/429 or network error → auto-fallback to curl_cffi; if both fail, report honestly (with `impersonated` flag)
+- Reports tag `TLS: impersonated (curl_cffi)` or `native (undici)`
+- Requires Python + `pip install curl_cffi`; without it, degrades to undici-only (main flow unaffected)
+- Rationale: *TLS Beyond the Browser* (ACM IMC 2019) — non-browser TLS clients are fingerprintable; impersonation closes that gap
 
-| 引擎 | 区域 | 路由 | 说明 |
+### 7. Engine adapters
+
+| Engine | Region | Route | Notes |
 |---|---|---|---|
-| duckduckgo | 国际 | 走代理 | `html.duckduckgo.com/html/` 免 key HTML 端点 |
-| bing | 国际 | 走代理 | `setmkt=en-US&cc=US`，从 `<cite>` 还原真实 URL（绕过 `ck/a` 跳转包装） |
-| bingcn | 国内 | 直连 | `cn.bing.com` |
-| baidu | 国内 | 直连 | 检测验证码页报错，`mu` 属性取真实 URL |
-| sogou | 国内 | 直连 | 移动端 + 桌面端双 fallback 绕过反爬 |
-| so (360) | 国内 | 直连 | `www.so.com` |
+| duckduckgo | international | proxy | `html.duckduckgo.com/html/` no-key HTML endpoint |
+| bing | international | proxy | `setmkt=en-US&cc=US`; reconstructs real URL from `<cite>` (bypasses the `ck/a` redirect wrapper) |
+| bingcn | CN | direct | `cn.bing.com` |
+| baidu | CN | direct | Detects CAPTCHA interstitial and errors out; reads `mu` attr for the real URL |
+| sogou | CN | direct | Mobile + desktop dual fallback to dodge anti-bot |
+| so (360) | CN | direct | `www.so.com` |
 
-查询含中日韩字符 → 默认国内引擎优先；纯拉丁 → 国际优先。`engine='all'` 全部并发。
+A query with CJK characters defaults to CN engines first; pure-Latin queries go international first. `engine='all'` fans out to every engine.
 
-### 8. undici v7 关键技术处理
+### 8. Key undici v7 handling
 
-- `interceptors.decompress()`：自动解压 gzip/br/deflate（Bing 国际版返回 brotli）
-- **手动循环跟随 3xx**：undici v7 的 `request()` 不再接受 `maxRedirections`，且 `redirect` 拦截器单独不够（per-request opts 默认 0 会短路）。手动循环还能逐跳重新路由代理/直连。
+- `interceptors.decompress()`: auto-decompress gzip/br/deflate (Bing international returns brotli)
+- **Manual 3xx redirect loop**: undici v7's `request()` no longer accepts `maxRedirections`, and the `redirect` interceptor alone isn't enough (per-request opts default to 0 and short-circuit). The manual loop also lets us re-route proxy/direct per hop.
 
 ---
 
-## 引用的论文
+## Tools
 
-实现中参考的国际论文（DOI 可查，检索自 OpenAlex 学术 API + DuckDuckGo/Bing）：
+### `web_search`
 
-### 结果融合 / 排序
+```jsonc
+{ "query": "anthropic claude api pricing", "num": 8, "engine": "auto" }
+```
 
-| 论文 | 年份 | 用途 | DOI |
-|---|---|---|---|
-| ranx.fuse: A Python Library for Metasearch | 2022 (CIKM) | RRF 实现参考，25 种融合算法 | [10.1145/3511808.3557207](https://doi.org/10.1145/3511808.3557207) |
-| Comparing Rank and Score Combination Methods for Data Fusion in IR | 2005 | CombMNZ 等融合法对比，RRF k 值依据 | [10.1007/s10791-005-6994-4](https://doi.org/10.1007/s10791-005-6994-4) |
-| The use of MMR, diversity-based reranking | 1998 (Carbonell) | 多样性重排奠基（待落地） | [10.1145/290941.291025](https://doi.org/10.1145/290941.291025) |
-| Fusion-based methods for result diversification in web search | 2018 (Information Fusion) | 融合 + 多样性结合 | [10.1016/j.inffus.2018.01.006](https://doi.org/10.1016/j.inffus.2018.01.006) |
+- `engine`: `auto` (default) | `all` | `duckduckgo` | `bing` | `bingcn` | `baidu` | `sogou` | `so`
 
-### 近似去重
+### `fetch_url`
 
-| 论文 | 年份 | 用途 | DOI |
-|---|---|---|---|
-| A Review for Weighted MinHash Algorithms | 2018 | MinHash/SimHash 综述 | [10.48550/arxiv.1811.04633](https://doi.org/10.48550/arxiv.1811.04633) |
-| Improved Near-Duplicate Detection for Aggregated and Paywalled News | 2025 (NAACL) | 近似去重新进展 | [10.18653/v1/2025.naacl-industry.73](https://doi.org/10.18653/v1/2025.naacl-industry.73) |
-| Effective and Fast Near Duplicate Detection via Signature-Based | 2016 | 签名去重工程实现 | [10.1155/2016/3919043](https://doi.org/10.1155/2016/3919043) |
+```jsonc
+{ "url": "https://example.com/page", "max_chars": 16000 }
+```
 
-### 并行 / 增量爬取 / 限速
+Fetch a URL, strip boilerplate, return markdown. Auto-routes proxy/direct by domain; falls back to TLS impersonation on 403.
 
-| 论文 | 年份 | 用途 | DOI |
-|---|---|---|---|
-| BUbiNG: Massive Crawling for the Masses | 2016 | 每主机礼貌队列、线性扩展 | [10.48550/arxiv.1601.06919](https://doi.org/10.48550/arxiv.1601.06919) |
-| SIMHAR — Smart Distributed Web Crawler for the Hidden Web | 2020 (IEEE Access) | 分布式队列 + SIM+Hash 去重 | [10.1109/access.2020.3004756](https://doi.org/10.1109/access.2020.3004756) |
-| Design of a Priority Based Frequency Regulated Incremental Crawler | 2010 | 频率感知增量爬取（缓存待落地） | [10.5120/23-131](https://doi.org/10.5120/23-131) |
-| On the Feasibility of Geographically Distributed Web Crawling | 2008 | 地理分布降低单点延迟 | [10.4108/icst.infoscale2008.3550](https://doi.org/10.4108/icst.infoscale2008.3550) |
+### `deep_research`
 
-### 反爬 / 封禁规避
+```jsonc
+{
+  "query": "中国空间站 最新进展",
+  "engines": ["bingcn", "baidu"],
+  "num_per_engine": 8,
+  "fetch_top_k": 4,
+  "fetch_chars": 6000
+}
+```
 
-| 论文 | 年份 | 用途 | DOI |
-|---|---|---|---|
-| TLS Beyond the Browser | 2019 (ACM IMC) | TLS/JA3 指纹暴露（P1 待落地） | [10.1145/3355369.3355601](https://doi.org/10.1145/3355369.3355601) |
-| FP-Crawlers: Studying the Resilience of Browser Fingerprinting | 2020 | 浏览器指纹识别 | [10.14722/madweb.2020.23010](https://doi.org/10.14722/madweb.2020.23010) |
-| A First Look at User-Installed Residential Proxies | 2024 (CNSM) | 住宅代理生态（代理池待落地） | [10.23919/cnsm62983.2024.10814519](https://doi.org/10.23919/cnsm62983.2024.10814519) |
-
-> 完整优化方案与差距分析见 [`docs/optimization-research.md`](./docs/optimization-research.md)。
+Multi-engine fan-out → dedup & RRF rank → fetch top-K → cited markdown report.
 
 ---
 
-## 工具
+## Installation
 
-- **web_search** `{query, num?, engine?}`
-  - `engine`: `auto`(默认) | `all` | `duckduckgo` | `bing` | `bingcn` | `baidu` | `sogou` | `so`
-- **fetch_url** `{url, max_chars?}` — 抓页面正文转 markdown，按域名自动判定代理/直连
-- **deep_research** `{query, engines?, num_per_engine?, fetch_top_k?, fetch_chars?}` — 多引擎并发 → 去重排序 → 抓取正文 → 带引用 markdown 报告
+### Prerequisites
 
-## 接入 Claude Code
+- **Node.js ≥ 18**
+- **Python 3** + `curl_cffi` (optional, for TLS impersonation on protected sites):
 
-项目级（已生成 `.mcp.json`）：
+  ```bash
+  pip install curl_cffi
+  ```
+
+- A proxy on `127.0.0.1:7890` (e.g. Clash) — set `PROXY_URL=""` to disable.
+
+### Build
+
+```bash
+git clone git@github.com:nuoyax/web-search-mcp.git
+cd web-search-mcp
+npm install
+```
+
+### Wire into Claude Code
+
+User-level (available in all projects):
+
+```bash
+claude mcp add web-search -s user -e PROXY_URL=http://127.0.0.1:7890 \
+  -- node /absolute/path/to/web-search-mcp/index.js
+```
+
+Or add to `.mcp.json` (project-level):
 
 ```json
 {
   "mcpServers": {
     "web-search": {
       "command": "node",
-      "args": ["D:\\agents\\web_search\\index.js"],
+      "args": ["/absolute/path/to/web-search-mcp/index.js"],
       "env": { "PROXY_URL": "http://127.0.0.1:7890" }
     }
   }
 }
 ```
 
-或用户级：
+### Verify
 
 ```bash
-claude mcp add web-search -- node D:/agents/web_search/index.js
+node index.js          # start the MCP server (stdio)
+node test-smoke.js     # smoke test every engine + fetch
 ```
 
-设 `PROXY_URL=""` 可禁用代理（如已开全局 VPN）。
+---
 
-## 运行 / 测试
+## Environment variables
 
-```bash
-npm install
-node index.js            # 启动 MCP server（stdio）
-node test-smoke.js       # 各引擎 + fetch 冒烟测试
-```
-
-## 依赖
-
-**Node（必需）**
-
-- `@modelcontextprotocol/sdk` — MCP server SDK
-- `undici` — HTTP（ProxyAgent + decompress 拦截器，手动跟随 3xx 以便逐跳重新路由代理/直连）
-- `cheerio` — HTML 解析
-- `turndown` — HTML → markdown
-- `zod` — 工具参数校验
-
-**Python（可选，用于 TLS 指纹伪装）**
-
-- `curl_cffi` — `pip install curl_cffi`，伪造浏览器 JA3/JA4 指纹突破 Cloudflare 等强风控
-
-## 环境变量
-
-| 变量 | 默认 | 作用 |
+| Variable | Default | Effect |
 |---|---|---|
-| `PROXY_URL` | `http://127.0.0.1:7890` | 代理地址；设为空字符串禁用代理 |
-| `CACHE_DISABLED` | `0` | 设 `1` 禁用结果缓存 |
-| `CACHE_DIR` | `./cache` | 缓存目录 |
+| `PROXY_URL` | `http://127.0.0.1:7890` | proxy endpoint; empty string disables proxying |
+| `CACHE_DISABLED` | `0` | set `1` to disable result caching |
+| `CACHE_DIR` | `./cache` | cache directory |
 
-## 已知限制
+---
 
-- 所有网络请求 20-25s 超时，不会卡死。
-- 百度偶尔触发验证码拦截，此时该引擎报错，`deep_research` 自动用其他引擎兜底。
-- Bing 国际版结果链接是 `bing.com/ck/a` 跳转包装，从结果块 `<cite>` 还原真实 URL。
-- DuckDuckGo 用 `html.duckduckgo.com/html/` 免 key HTML 端点，需走代理。
-- TLS 指纹伪装依赖 Python + `curl_cffi`（`pip install curl_cffi`）。未安装时降级为纯 undici，强风控站点（如 `docs.anthropic.com`）会 403；安装后自动恢复。
-- 缓存按站点 TTL 过期，不主动后台刷新；过期后下次调用重新抓取。设 `CACHE_DISABLED=1` 可禁用。
+## Referenced papers
+
+Papers referenced in the implementation (DOIs verifiable; retrieved via the OpenAlex academic API + DuckDuckGo/Bing):
+
+### Result fusion / ranking
+
+| Paper | Year | Used for | DOI |
+|---|---|---|---|
+| ranx.fuse: A Python Library for Metasearch | 2022 (CIKM) | RRF implementation reference; 25 fusion algorithms | [10.1145/3511808.3557207](https://doi.org/10.1145/3511808.3557207) |
+| Comparing Rank and Score Combination Methods for Data Fusion in IR | 2005 | Comparison of CombMNZ etc.; basis for RRF k | [10.1007/s10791-005-6994-4](https://doi.org/10.1007/s10791-005-6994-4) |
+| The use of MMR, diversity-based reranking | 1998 (Carbonell) | Foundational diversity reranking (not yet implemented) | [10.1145/290941.291025](https://doi.org/10.1145/290941.291025) |
+| Fusion-based methods for result diversification in web search | 2018 (Information Fusion) | Combining fusion and diversity | [10.1016/j.inffus.2018.01.006](https://doi.org/10.1016/j.inffus.2018.01.006) |
+
+### Near-duplicate detection
+
+| Paper | Year | Used for | DOI |
+|---|---|---|---|
+| A Review for Weighted MinHash Algorithms | 2018 | MinHash/SimHash survey | [10.48550/arxiv.1811.04633](https://doi.org/10.48550/arxiv.1811.04633) |
+| Improved Near-Duplicate Detection for Aggregated and Paywalled News | 2025 (NAACL) | Recent advances in near-dup detection | [10.18653/v1/2025.naacl-industry.73](https://doi.org/10.18653/v1/2025.naacl-industry.73) |
+| Effective and Fast Near Duplicate Detection via Signature-Based | 2016 | Signature-based dedup engineering | [10.1155/2016/3919043](https://doi.org/10.1155/2016/3919043) |
+
+### Parallel / incremental crawling / rate limiting
+
+| Paper | Year | Used for | DOI |
+|---|---|---|---|
+| BUbiNG: Massive Crawling for the Masses | 2016 | Per-host politeness queue, linear scaling | [10.48550/arxiv.1601.06919](https://doi.org/10.48550/arxiv.1601.06919) |
+| SIMHAR — Smart Distributed Web Crawler for the Hidden Web | 2020 (IEEE Access) | Distributed queue + SIM+Hash dedup | [10.1109/access.2020.3004756](https://doi.org/10.1109/access.2020.3004756) |
+| Design of a Priority Based Frequency Regulated Incremental Crawler | 2010 | Frequency-aware incremental crawling (caching) | [10.5120/23-131](https://doi.org/10.5120/23-131) |
+| On the Feasibility of Geographically Distributed Web Crawling | 2008 | Geo-distributed crawling reduces latency | [10.4108/icst.infoscale2008.3550](https://doi.org/10.4108/icst.infoscale2008.3550) |
+
+### Anti-bot / blocking evasion
+
+| Paper | Year | Used for | DOI |
+|---|---|---|---|
+| TLS Beyond the Browser | 2019 (ACM IMC) | TLS/JA3 fingerprint exposure (P1) | [10.1145/3355369.3355601](https://doi.org/10.1145/3355369.3355601) |
+| FP-Crawlers: Studying the Resilience of Browser Fingerprinting | 2020 | Browser fingerprinting detection | [10.14722/madweb.2020.23010](https://doi.org/10.14722/madweb.2020.23010) |
+| A First Look at User-Installed Residential Proxies | 2024 (CNSM) | Residential-proxy ecosystem (proxy pool, planned) | [10.23919/cnsm62983.2024.10814519](https://doi.org/10.23919/cnsm62983.2024.10814519) |
+
+> Full optimization plan and gap analysis: [`docs/optimization-research.md`](./docs/optimization-research.md).
+
+---
+
+## Project structure
+
+```
+web-search-mcp/
+├── index.js              # MCP server entry (registers 3 tools, stdio)
+├── src/
+│   ├── http.js           # HTTP layer + proxy routing + token bucket + backoff
+│   ├── engines.js        # 6 engine adapters
+│   ├── fetcher.js        # HTML → markdown + TLS fallback dispatch
+│   ├── research.js       # RRF fusion + SimHash dedup pipeline
+│   ├── simhash.js        # 64-bit Charikar SimHash
+│   ├── cache.js          # disk KV with frequency-aware TTL
+│   └── tlsbypass.js      # curl_cffi TLS impersonation bridge
+├── test-smoke.js         # smoke test
+├── docs/
+│   ├── optimization-research.md
+│   ├── architecture.svg
+│   └── pipeline.svg
+├── .mcp.json             # project-level MCP registration
+└── package.json
+```
+
+---
+
+## Known limitations
+
+- All network requests time out in 20–25 s; nothing hangs.
+- Baidu occasionally returns a CAPTCHA interstitial; that engine then errors and `deep_research` falls back to the other engines.
+- Bing international wraps result links in `bing.com/ck/a`; the real URL is reconstructed from the result's `<cite>`.
+- DuckDuckGo uses the no-key `html.duckduckgo.com/html/` endpoint, which requires the proxy.
+- TLS impersonation depends on Python + `curl_cffi`. Without it, falls back to undici-only and hard-case sites (e.g. `docs.anthropic.com`) return 403; with it, impersonation is automatic.
+- The cache expires by TTL without background refresh; the next call after expiry re-fetches. Set `CACHE_DISABLED=1` to disable.
+
+---
+
+## License
+
+MIT
