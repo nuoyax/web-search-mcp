@@ -10,6 +10,7 @@ import {
 } from "./engines.js";
 import { fetchUrl } from "./fetcher.js";
 import { resultFingerprint, hamming64 } from "./simhash.js";
+import { rerank, extractQueryTerms, authorityScore, chunkAndScore } from "./rerank.js";
 
 const MAX_PARALLEL_FETCH = 4;
 
@@ -320,7 +321,8 @@ export async function deepResearch(query, opts = {}) {
   // Rank via Reciprocal Rank Fusion across engines. As a tiebreaker, results
   // that match query terms in the title get a small boost — this only orders
   // results with near-equal RRF scores and never overrides cross-engine
-  // consensus.
+  // consensus. (This first pass has no fetched bodies yet; the full rerank
+  // with authority/recency/term-density runs after the top-K fetch.)
   const queryTerms = query.toLowerCase().split(/\s+/).filter(Boolean);
   const ranked = deduped
     .map((r) => {
@@ -350,6 +352,7 @@ export async function deepResearch(query, opts = {}) {
           status: f.status,
           markdown: f.markdown || "",
           useProxy: f.useProxy,
+          publishedTime: f.publishedTime || null,
           sources: r.sources,
         });
       } catch (e) {
@@ -365,14 +368,33 @@ export async function deepResearch(query, opts = {}) {
     }),
   );
 
+  // Second-pass rerank: now that we have fetched bodies + publish dates, layer
+  // the authority / recency / term-density signals on top of RRF (mirrors how
+  // Tavily/Perplexity apply authority + freshness reranks after retrieval).
+  // The fetched map keys by normalized URL so the rerank can match a fetched
+  // body back to its ranked entry. Results below the fetchTopK cutoff keep
+  // their RRF-only score (no body fetched → no density/recency signal).
+  const fetchedByUrl = new Map();
+  for (const f of fetched) {
+    if (f.ok && f.markdown) {
+      try {
+        const u = new URL(f.url);
+        fetchedByUrl.set((u.hostname + u.pathname).replace(/\/+$/, "").toLowerCase(), f);
+      } catch { /* keep */ }
+    }
+  }
+  const reranked = rerank(ranked, query, { fetchedByUrl, queryTerms: extractQueryTerms(query) });
+  log(`reranked (top score ${reranked[0]?.score?.toFixed(4) || "n/a"})`);
+
   // Compose report.
   const report = composeReport({
     query,
     engines: engineKeys,
     engineErrors: errors,
     engineDropped: dropped,
-    ranked,
+    ranked: reranked,
     fetched,
+    queryTerms: extractQueryTerms(query),
   });
 
   return {
@@ -387,7 +409,7 @@ export async function deepResearch(query, opts = {}) {
   };
 }
 
-function composeReport({ query, engines, engineErrors, engineDropped, ranked, fetched }) {
+function composeReport({ query, engines, engineErrors, engineDropped, ranked, fetched, queryTerms }) {
   const lines = [];
   lines.push(`# Deep Research: ${query}`);
   lines.push("");
@@ -398,6 +420,10 @@ function composeReport({ query, engines, engineErrors, engineDropped, ranked, fe
   if (engineDropped && engineDropped.length) {
     lines.push(`_Timed out engines: ${engineDropped.map((e) => e.engine).join(", ")}_`);
   }
+  lines.push("");
+  // Explain the rerank so the caller understands why sources are ordered as
+  // they are: RRF consensus + authority/recency/term-density signals.
+  lines.push("_Ranking: Reciprocal Rank Fusion (k=60) across engines, then authority / recency / passage-term-density rerank. Fetched passages are numbered `[n]` for citation._");
   lines.push("");
 
   // Synthesis: pull first 1-2 sentences from each fetched source, cite.
@@ -431,16 +457,29 @@ function composeReport({ query, engines, engineErrors, engineDropped, ranked, fe
   });
   lines.push("");
 
-  // Detailed fetched content (truncated). Each block labeled with its source.
+  // Detailed fetched content as reranked passage chunks (Tavily
+  // chunks_per_source style). Each source shows its top-K most query-relevant
+  // passages, numbered `[n]` so the model can cite a specific passage rather
+  // than the whole page. Falls back to a truncated body if chunking yields
+  // nothing (e.g. very short fetches).
   lines.push("## Fetched content");
   for (const f of fetched.filter((x) => x.ok && x.markdown)) {
     const srcLabel = f.sources && f.sources.length ? ` ${sourcesLabel(f.sources)} (source: ${f.sources.join(", ")})` : "";
     lines.push(`### ${f.title || f.url}${srcLabel}`);
     lines.push(`URL: ${f.url}`);
+    if (f.publishedTime) lines.push(`Published: ${f.publishedTime}`);
     lines.push("");
-    const body = f.markdown.slice(0, 2500);
-    lines.push(body);
-    lines.push("");
+    const chunks = chunkAndScore(f.markdown, queryTerms || [], 3);
+    if (chunks.length) {
+      for (const c of chunks) {
+        lines.push(`[${c.index}] ${c.text}`);
+        lines.push("");
+      }
+    } else {
+      // Fallback: no chunkable passages — show a truncated body.
+      lines.push(f.markdown.slice(0, 2500));
+      lines.push("");
+    }
   }
 
   // Data-source summary so the origin of the synthesized answer is explicit.
