@@ -3,7 +3,9 @@
 // the proxy; CN engines (baidu, sogou, so/360, bing-cn) go direct.
 
 import * as cheerio from "cheerio";
-import { httpGet } from "./http.js";
+import { httpGet, isHostCooling } from "./http.js";
+import { curlFetchThrottled } from "./fetcher.js";
+import { curlAvailable } from "./tlsbypass.js";
 
 export const ENGINES = {
   duckduckgo: {
@@ -12,6 +14,20 @@ export const ENGINES = {
     international: true,
     favicon: "https://duckduckgo.com/favicon.ico",
     search: searchDuckDuckGo,
+  },
+  brave: {
+    name: "brave",
+    label: "Brave",
+    international: true,
+    favicon: "https://search.brave.com/static/favicon.ico",
+    search: searchBrave,
+  },
+  wikipedia: {
+    name: "wikipedia",
+    label: "Wikipedia",
+    international: true,
+    favicon: "https://en.wikipedia.org/static/favicon/wikipedia.ico",
+    search: searchWikipedia,
   },
   bing: {
     name: "bing",
@@ -84,10 +100,14 @@ function isCjk(query) {
 }
 
 // Pick a sensible default engine order based on the query language.
+// Intl: lead with Brave + Wikipedia (free, currently reachable from the
+// egress IP) then Bing; DuckDuckGo last as a best-effort fallback (it's
+// currently IP-blocked from this host — fail-fast neutralizes its failure).
+// CN: domestic engines first, Wikipedia (zh) tail for concept recall.
 export function defaultEngineOrder(query) {
   const cjk = isCjk(query);
-  if (cjk) return ["bingcn", "baidu", "so", "sogou", "duckduckgo", "bing"];
-  return ["duckduckgo", "bing", "bingcn", "baidu"];
+  if (cjk) return ["bingcn", "baidu", "so", "sogou", "wikipedia", "brave", "duckduckgo", "bing"];
+  return ["brave", "wikipedia", "bing", "bingcn", "baidu", "duckduckgo"];
 }
 
 // ---------- DuckDuckGo (HTML endpoint, no API key) ----------
@@ -114,6 +134,118 @@ async function searchDuckDuckGo(query, { num = 10 } = {}) {
     if (title && href) results.push({ title, url: href, snippet });
   });
   return results;
+}
+
+// ---------- Brave (curl_cffi, TLS-impersonated HTML) ----------
+// Brave is the one free international HTML engine currently reachable from
+// this host's egress IP (DuckDuckGo/Google/Startpage/Mojeek are all blocked
+// or JS-walled from here). It returns ~20 results/page, but rate-limits
+// aggressively (~5 req/min → 429). We handle that with:
+//   1. A wide per-host minInterval (12s ≈ 5/min) via the token bucket.
+//   2. A 60s circuit breaker — tlsbypass.curlFetch calls coolHost() on 429,
+//      and we check isHostCooling() up front to short-circuit to a
+//      "rate-limited" failure instead of firing a request certain to 429
+//      (which would both waste a slot AND burn more of the rate budget).
+//   3. fail-fast fan-out (raceToQuorum) demotes a rate-limited Brave to the
+//      other engines (Wikipedia/Bing) for that query.
+// Requires curl_cffi (falls back to a clear error if unavailable).
+export async function searchBrave(query, { num = 10 } = {}) {
+  const host = "search.brave.com";
+  if (isHostCooling(host)) {
+    throw new Error("Brave rate-limited (cooling down, try another engine)");
+  }
+  if (!(await curlAvailable())) {
+    throw new Error("Brave needs curl_cffi (TLS impersonation) which is not installed");
+  }
+  const url = `https://${host}/search?q=${encodeURIComponent(query)}&source=web`;
+  const res = await curlFetchThrottled(url, {
+    timeoutMs: 20_000,
+    minIntervalMs: 12_000, // ~5 req/min cap; the token bucket enforces this
+    headers: {
+      Referer: `https://${host}/`,
+      "Accept-Language": isCjk(query) ? "zh-CN,zh;q=0.9,en;q=0.8" : "en-US,en;q=0.9",
+    },
+  });
+  if (res.blocked) {
+    throw new Error("Brave returned 429 (rate-limited); cooling 60s");
+  }
+  if (!res.ok || !res.text) {
+    throw new Error(`Brave fetch failed: ${res.error || "no body"}`);
+  }
+  return parseBraveResults(res.text, num);
+}
+
+// Parse Brave SERP HTML into results. Pure (no network) so it's unit-testable
+// against a fixture. Brave wraps each result in `<div class="snippet"
+// data-pos="N" data-type="web">` with the first `<a href=EXTERNAL_URL>` holding
+// the target link; its inner `.title` (or text) is the title, and
+// `.snippet-description` is the blurb.
+export function parseBraveResults(html, num) {
+  const $ = cheerio.load(html);
+  const out = [];
+  $("div[data-pos][data-type='web'], div[data-pos]").each((_, el) => {
+    if (out.length >= num) return false;
+    const $el = $(el);
+    // The first external <a> in the block is the result link; Brave's own
+    // nav/anchor links are relative or brave.com — skip those.
+    let a = null;
+    let href = "";
+    $el.find("a").each((__, anchor) => {
+      const h = $(anchor).attr("href") || "";
+      if (!href && /^https?:\/\//.test(h) && !/brave\.com/i.test(h)) {
+        href = h;
+        a = $(anchor);
+        return false;
+      }
+      return true;
+    });
+    if (!href) return;
+    const title = (a?.find(".title").text() || a?.text() || "").trim();
+    const snippet = $el.find(".snippet-description, .snippet-content").first().text().trim().replace(/\s+/g, " ");
+    if (title) out.push({ title, url: href, snippet });
+  });
+  return out;
+}
+
+// ---------- Wikipedia (free MediaWiki API, no key, no anti-bot) ----------
+// Wikipedia's action=query&list=search API is completely free, requires no key,
+// and (unlike every HTML search engine from this egress IP) has no anti-bot
+// rate limiting — 8 rapid calls all returned 200 in testing. It's the stable
+// backbone for international concept queries. Not a general web search
+// (encyclopedic only), but zero-cost to include and raises recall for
+// technical/conceptual/historical queries. Uses zh.wikipedia.org for CJK.
+export async function searchWikipedia(query, { num = 10 } = {}) {
+  const host = isCjk(query) ? "zh.wikipedia.org" : "en.wikipedia.org";
+  const url =
+    `https://${host}/w/api.php?action=query&list=search` +
+    `&srsearch=${encodeURIComponent(query)}&srlimit=${num}&format=json`;
+  const { text, status } = await httpGet(url, {
+    forceProxy: true,
+    accept: "application/json",
+    timeoutMs: 20_000,
+  });
+  if (status >= 400) throw new Error(`Wikipedia HTTP ${status}`);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("Wikipedia returned non-JSON response");
+  }
+  const search = data?.query?.search;
+  if (!Array.isArray(search)) return [];
+  const proto = `https://${host}`;
+  const out = [];
+  for (const r of search) {
+    if (out.length >= num) break;
+    const title = (r.title || "").trim();
+    if (!title) continue;
+    // MediaWiki title → canonical URL path (spaces → underscores, URL-encoded).
+    const path = "/wiki/" + encodeURIComponent(title.replace(/ /g, "_"));
+    // sr.snippet has <span class="searchmatch">…</span> highlights; strip them.
+    const snippet = (r.snippet || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    out.push({ title, url: proto + path, snippet });
+  }
+  return out;
 }
 
 // ---------- Bing (international) ----------

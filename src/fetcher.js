@@ -185,7 +185,9 @@ function extractByDensity($, $body) {
 // (HARDCASE_HOSTS) are the most aggressively rate-limited — without this, the
 // deep_research semaphore (concurrency 4) could fire 4 concurrent curl_cffi
 // processes at one host and trip the very anti-bot signal we're avoiding.
-async function curlFetchThrottled(url, opts) {
+// Exported so engine adapters (e.g. Brave, which speaks curl_cffi natively)
+// can reuse the same per-host throttling.
+export async function curlFetchThrottled(url, opts) {
   const host = hostKeyFor(url);
   await waitForBucket(host, opts);
   try {

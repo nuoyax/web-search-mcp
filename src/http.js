@@ -197,6 +197,18 @@ export function coolHost(host, until) {
   if (!b.cooldownUntil || until > b.cooldownUntil) b.cooldownUntil = until;
 }
 
+// Is a host currently in a forced cool-down (e.g. after a 429)? Engines can
+// check this before issuing a request to a strictly-rate-limited host and
+// short-circuit to a "rate-limited (cooling)" failure instead of firing a
+// request that is certain to 429 — that both wastes a slot and burns the
+// host's rate-limit budget further. Read-only, no allocation on cold path.
+export function isHostCooling(host) {
+  const b = HOST_BUCKETS.get(host);
+  if (!b || !b.cooldownUntil) return false;
+  if (Date.now() >= b.cooldownUntil) return false;
+  return true;
+}
+
 // Exported so the curl_cffi fallback (tlsbypass.js) routes through the SAME
 // per-host token bucket as undici — hard-case hosts need politeness most.
 export { waitForBucket, releaseBucket };
