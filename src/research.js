@@ -19,30 +19,151 @@ const MAX_PARALLEL_FETCH = 4;
 // return very different result counts.
 const RRF_K = 60;
 
-// Run multiple engines concurrently, tolerating individual failures.
-// Returns each engine's results WITHIN-engine rank (1-based) so callers can
-// compute Reciprocal Rank Fusion across engines.
+// Fail-fast engine fan-out: resolve as soon as a quorum is met (enough
+// engines succeeded OR one engine returned enough results), or a soft
+// deadline elapses, or all tasks settle — whichever is first. Laggards still
+// in flight at resolve time are NOT cancelled (cancellation would need an
+// AbortSignal plumbed through httpGet→undici, out of scope); they settle in
+// the background and are reported as "timed out" so they don't silently drop.
+//
+// Why: a dead/slow engine (e.g. DDG blocked from the egress IP, failing after
+// the 25s timeout) used to gate the whole response behind Promise.allSettled.
+// With raceToQuorum a fast engine (bing ~460ms) returning ≥minResults
+// satisfies the quorum and the response goes out immediately; the laggard's
+// eventual failure is logged, not awaited.
+//
+// Returns { ok, errors, dropped } — `dropped` are engines that hadn't
+// settled by resolve time (reported separately so callers can mark them).
+// `onSettle({status, value|reason, index})` fires for every task (including
+// late-settling laggards after resolve) so callers can collect results in the
+// background without awaiting the full set.
+export async function raceToQuorum(tasks, { deadlineMs, minEngines, minResults, onSettle } = {}) {
+  const ok = [];
+  const errors = [];
+  const dropped = [];
+  const total = tasks.length;
+  let resolved = false;
+  let timer = null;
+
+  return new Promise((resolve) => {
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolve({ ok, errors, dropped });
+    };
+
+    const checkQuorum = () => {
+      if (resolved) return;
+      const enoughEngines = ok.length >= minEngines;
+      const enoughResults = ok.some((b) => b?.results?.length >= minResults);
+      if (enoughEngines || enoughResults) finish();
+    };
+
+    // Soft deadline: resolve with whatever we have. Laggards keep running.
+    if (deadlineMs) timer = setTimeout(finish, deadlineMs);
+
+    tasks.forEach((task, i) => {
+      Promise.resolve()
+        .then(() => task())
+        .then((value) => {
+          if (resolved) {
+            if (onSettle) onSettle({ status: "late-fulfilled", value, index: i });
+            return;
+          }
+          ok.push(value);
+          if (onSettle) onSettle({ status: "fulfilled", value, index: i });
+          checkQuorum();
+          // If everything has now settled, finish immediately (no point waiting
+          // out the deadline with a complete result set).
+          if (ok.length + errors.length >= total) finish();
+        })
+        .catch((err) => {
+          if (resolved) {
+            if (onSettle) onSettle({ status: "late-rejected", reason: err, index: i });
+            return;
+          }
+          errors.push({ engine: `engine#${i}`, error: String(err?.message || err) });
+          if (onSettle) onSettle({ status: "rejected", reason: err, index: i });
+          if (ok.length + errors.length >= total) finish();
+        });
+    });
+  });
+}
+
+// Run multiple engines concurrently, tolerating individual failures and
+// resolving as soon as a quorum is met (fail-fast). Returns each engine's
+// results WITHIN-engine rank (1-based) so callers can compute Reciprocal
+// Rank Fusion across engines.
+//
+// `dropped` = engines still in flight when the quorum/deadline resolved;
+// reported as "(timed out)" in the deep_research data-sources summary.
 async function runEngines(query, engineKeys, numPerEngine, log) {
-  const engines = engineKeys
-    .map((k) => ENGINES[k])
-    .filter(Boolean);
-  const settled = await Promise.allSettled(
-    engines.map(async (e) => {
+  const tasks = engineKeys.map((k) => {
+    const e = ENGINES[k];
+    const run = async () => {
       const results = await e.search(query, { num: numPerEngine });
       // Tag each result with its (1-based) rank within this engine.
       const ranked = results.map((r, i) => ({ ...r, rank: i + 1 }));
       return { engine: e.name, label: e.label, favicon: e.favicon, results: ranked };
-    }),
+    };
+    return { name: e.name, label: e.label, run };
+  });
+
+  const { ok, errors, dropped } = await raceToQuorum(
+    tasks.map((t) => t.run),
+    {
+      // deep_research is recall-oriented: collect every engine that returns
+      // within the deadline rather than short-circuiting on the first strong
+      // engine (that's web_search's job). minEngines=tasks.length +
+      // minResults=Infinity means the ONLY early resolve is "all engines
+      // settled" — otherwise we wait out the deadline and gather whatever came
+      // back. Engines still in flight at the deadline (e.g. DDG's 25s timeout)
+      // are reported as "timed out"; engines that throw (e.g. baidu CAPTCHA)
+      // land in errors. Both are surfaced in the Data-sources summary.
+      deadlineMs: 4_000,
+      minEngines: tasks.length,
+      minResults: Infinity,
+      // Late settle: record laggard results so dropped engines that DO
+      // eventually succeed still contribute to the report (best-effort).
+      onSettle: (ev) => {
+        if (ev.status === "late-fulfilled" && ev.value) {
+          ok.push(ev.value);
+          const idx = dropped.findIndex((d) => d.name === ev.value.engine);
+          if (idx >= 0) dropped.splice(idx, 1);
+        } else if (ev.status === "late-rejected") {
+          const t = tasks[ev.index];
+          if (t) {
+            errors.push({ engine: t.name, error: String(ev.reason?.message || ev.reason) });
+            const idx = dropped.findIndex((d) => d.name === t.name);
+            if (idx >= 0) dropped.splice(idx, 1);
+          }
+        }
+      },
+    },
   );
-  const ok = [];
-  const errors = [];
-  for (let i = 0; i < settled.length; i++) {
-    const s = settled[i];
-    if (s.status === "fulfilled") ok.push(s.value);
-    else errors.push({ engine: engines[i].name, error: String(s.reason?.message || s.reason) });
+
+  // Re-attribute errors that came back as "engine#i" placeholders to real names.
+  for (const err of errors) {
+    if (/^engine#\d+$/.test(err.engine)) {
+      const idx = Number(err.engine.slice(7));
+      if (tasks[idx]) err.engine = tasks[idx].name;
+    }
   }
-  if (log) log(`engines ok=${ok.length} fail=${errors.length}`);
-  return { ok, errors };
+
+  // Engines that never settled (and never did via onSettle) → dropped/timed-out.
+  const settledNames = new Set([
+    ...ok.map((b) => b.engine),
+    ...errors.map((e) => e.engine),
+  ]);
+  for (const t of tasks) {
+    if (!settledNames.has(t.name)) {
+      dropped.push({ engine: t.name, label: t.label, error: "timed out (slow engine)" });
+    }
+  }
+
+  if (log) log(`engines ok=${ok.length} fail=${errors.length} dropped=${dropped.length}`);
+  return { ok, errors, dropped };
 }
 
 function normUrl(u) {
@@ -175,7 +296,7 @@ export async function deepResearch(query, opts = {}) {
   const fetchChars = opts.fetchChars ?? 6_000;
 
   log(`query="${query}" engines=[${engineKeys.join(",")}]`);
-  const { ok, errors } = await runEngines(query, engineKeys, numPerEngine, log);
+  const { ok, errors, dropped } = await runEngines(query, engineKeys, numPerEngine, log);
 
   // Flatten + tag engine. Preserve within-engine rank from runEngines.
   const flat = [];
@@ -249,6 +370,7 @@ export async function deepResearch(query, opts = {}) {
     query,
     engines: engineKeys,
     engineErrors: errors,
+    engineDropped: dropped,
     ranked,
     fetched,
   });
@@ -260,17 +382,21 @@ export async function deepResearch(query, opts = {}) {
     totalDedup: deduped.length,
     fetchedCount: fetched.filter((f) => f.ok).length,
     errors,
+    dropped,
     report,
   };
 }
 
-function composeReport({ query, engines, engineErrors, ranked, fetched }) {
+function composeReport({ query, engines, engineErrors, engineDropped, ranked, fetched }) {
   const lines = [];
   lines.push(`# Deep Research: ${query}`);
   lines.push("");
   lines.push(`_Engines: ${engines.join(", ")}_`);
   if (engineErrors.length) {
     lines.push(`_Failed engines: ${engineErrors.map((e) => e.engine).join(", ")}_`);
+  }
+  if (engineDropped && engineDropped.length) {
+    lines.push(`_Timed out engines: ${engineDropped.map((e) => e.engine).join(", ")}_`);
   }
   lines.push("");
 
@@ -319,7 +445,12 @@ function composeReport({ query, engines, engineErrors, ranked, fetched }) {
 
   // Data-source summary so the origin of the synthesized answer is explicit.
   lines.push("## Data sources");
-  lines.push(`Retrieved from ${engines.length} engine(s)${engineErrors.length ? ` (${engineErrors.length} failed)` : ""}.`);
+  const droppedCount = engineDropped?.length ?? 0;
+  lines.push(
+    `Retrieved from ${engines.length} engine(s)` +
+      `${engineErrors.length ? ` (${engineErrors.length} failed)` : ""}` +
+      `${droppedCount ? ` (${droppedCount} timed out)` : ""}.`,
+  );
   lines.push("");
   // Engine -> result count (from ranked sources) + fetch status.
   const byEngine = new Map();
@@ -331,10 +462,12 @@ function composeReport({ query, engines, engineErrors, ranked, fetched }) {
   for (const eng of engines) {
     const cnt = byEngine.get(eng) ?? 0;
     const failed = engineErrors.some((e) => e.engine === eng);
+    const timedOut = engineDropped?.some((e) => e.engine === eng);
     const img = faviconImg(eng, ENGINES[eng]?.label || eng);
     const prefix = img ? `${img} ` : "";
     const label = ENGINES[eng]?.label || eng;
-    lines.push(`- ${prefix}**${label}** — ${cnt} result(s)${failed ? " (failed)" : ""}`);
+    const tag = failed ? " (failed)" : timedOut ? " (timed out)" : "";
+    lines.push(`- ${prefix}**${label}** — ${cnt} result(s)${tag}`);
   }
   const fetchedOk = fetched.filter((f) => f.ok).length;
   lines.push("");

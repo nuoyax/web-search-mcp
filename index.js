@@ -16,7 +16,7 @@ import {
   sourcesLabel,
 } from "./src/engines.js";
 import { fetchUrl } from "./src/fetcher.js";
-import { deepResearch } from "./src/research.js";
+import { deepResearch, raceToQuorum } from "./src/research.js";
 import { cacheGet, cacheGetStale, cacheSet, cacheKey, CACHE_ENABLED } from "./src/cache.js";
 
 const log = (...args) => process.stderr.write("[web-search] " + args.join(" ") + "\n");
@@ -68,24 +68,55 @@ server.tool(
       };
     }
 
-    const settled = await Promise.allSettled(
-      valid.map(async (k) => {
-        const e = ENGINES[k];
+    // Fail-fast fan-out: resolve as soon as a quorum of engines succeeds (or
+    // one engine returns ≥ ceil(num/2) results), with a soft deadline so a
+    // dead/slow engine (e.g. DDG blocked from the egress IP, timing out at
+    // 25s) doesn't gate the fast engine (bing ~460ms). Laggards settle in the
+    // background; their eventual failure is logged, not awaited.
+    const tasks = valid.map((k) => {
+      const e = ENGINES[k];
+      const run = async () => {
         const results = await e.search(query, { num });
         // Resolve baidu redirect links in parallel so 8 wrapped links resolve
         // in ~1s (concurrency-capped) instead of ~3.4s serial. The per-host
         // token bucket still paces the actual HTTP — no extra anti-bot risk.
         await resolveBaiduRedirects(results);
         return { engine: k, label: e.label, favicon: e.favicon, results };
-      }),
-    );
+      };
+      run.engineName = k;
+      return { name: k, run };
+    });
 
     const out = [];
     const errs = [];
-    settled.forEach((s, i) => {
-      if (s.status === "fulfilled") out.push(s.value);
-      else errs.push(`${valid[i]}: ${s.reason?.message || s.reason}`);
-    });
+    const pending = new Map(tasks.map((t) => [t.name, t]));
+
+    await raceToQuorum(
+      tasks.map((t) => t.run),
+      {
+        deadlineMs: 3_500,
+        minEngines: Math.min(2, tasks.length),
+        minResults: Math.max(1, Math.ceil(num / 2)),
+        onSettle: (ev) => {
+          const t = tasks[ev.index];
+          if (!t) return;
+          if (ev.status === "fulfilled" || ev.status === "late-fulfilled") {
+            out.push(ev.value);
+            pending.delete(t.name);
+          } else {
+            // rejected / late-rejected
+            errs.push(`${t.name}: ${ev.reason?.message || ev.reason}`);
+            pending.delete(t.name);
+          }
+        },
+      },
+    );
+
+    // Engines still pending at resolve time are "timed out" — record them so
+    // the user sees why an expected engine is missing.
+    for (const t of pending.values()) {
+      errs.push(`${t.name}: timed out (slow engine)`);
+    }
 
     const text = formatSearchResults(query, out, errs);
     if (out.length) cacheSet(key, text, query); // fire-and-forget: don't block response on disk write
