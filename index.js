@@ -57,7 +57,7 @@ server.tool(
     // Cache lookup. Key excludes nothing user-visible; results from a given
     // (query, num, engine) are stable enough to reuse across the TTL.
     const key = cacheKey("web_search", { query, num, engine });
-    const cached = cacheGet(key);
+    const cached = await cacheGet(key);
     if (cached) {
       const ageMin = Math.round(cached.age / 60000);
       log(`web_search cache HIT (age ${ageMin}min) for: ${query}`);
@@ -90,7 +90,7 @@ server.tool(
     });
 
     const text = formatSearchResults(query, out, errs);
-    if (out.length) cacheSet(key, text, query);
+    if (out.length) cacheSet(key, text, query); // fire-and-forget: don't block response on disk write
     return { content: [{ type: "text", text }] };
   },
 );
@@ -148,7 +148,7 @@ server.tool(
     try {
       // Cache fetched pages by URL (+max_chars) with site-aware TTL.
       const key = cacheKey("fetch_url", { url, max_chars });
-      const fresh = cacheGet(key);
+      const fresh = await cacheGet(key);
 
       // Fresh hit: serve immediately.
       if (fresh) {
@@ -164,7 +164,7 @@ server.tool(
       // Stale-but-validators: drive a conditional revalidation
       // (If-None-Match / If-Modified-Since). On 304 we reuse the cached body
       // and refresh TTL; on a fresh 200 we replace the entry with new validators.
-      const stale = cacheGetStale(key);
+      const stale = await cacheGetStale(key);
       if (stale && stale.value && (stale.etag || stale.lastModified)) {
         const { title, useProxy, markdown } = parseCachedFetch(stale.value);
         const result = await fetchUrl(url, {
@@ -263,7 +263,7 @@ server.tool(
         fetch_top_k: args.fetch_top_k,
         fetch_chars: args.fetch_chars,
       });
-      const cached = cacheGet(key);
+      const cached = await cacheGet(key);
       if (cached) {
         const ageMin = Math.round(cached.age / 60000);
         log(`deep_research cache HIT (age ${ageMin}min) for: ${args.query}`);

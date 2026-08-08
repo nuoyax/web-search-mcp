@@ -8,6 +8,15 @@ const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+// Accept-Language defaults by route. A real CN browser hitting baidu.com
+// (direct, CN IP) sends zh-CN first; a real US browser hitting duckduckgo.com
+// (via proxy, US egress) sends en-US first. The old single mixed header was a
+// fingerprint inconsistency of the kind FP-Crawlers (10.14722/madweb.2020.23010)
+// flags: UA says Chrome but Accept-Language doesn't match the locale implied by
+// the route. Adapters can still override via opts.acceptLanguage.
+const AL_DIRECT = "zh-CN,zh;q=0.9,en;q=0.8";
+const AL_PROXY = "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7";
+
 // Set PROXY_URL="" to force-disable proxying (e.g. when already on a VPN).
 const PROXY_URL = process.env.PROXY_URL ?? "http://127.0.0.1:7890";
 
@@ -223,10 +232,15 @@ export async function httpGet(url, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRetries = opts.retries ?? 2;
 
+  // Decide CN-direct vs international-proxy for a URL so we can pick a
+  // locale-appropriate Accept-Language (see AL_DIRECT / AL_PROXY).
+  const route = routeFor(url, opts);
+  const { dispatcher, useProxy } = route;
+
   const headers = {
     "User-Agent": opts.userAgent ?? DEFAULT_UA,
     "Accept-Language":
-      opts.acceptLanguage ?? "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+      opts.acceptLanguage ?? (useProxy ? AL_PROXY : AL_DIRECT),
     Accept: opts.accept ?? "*/*",
     ...opts.headers,
   };

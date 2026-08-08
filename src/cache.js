@@ -10,7 +10,7 @@
 // stored validators and reuse the old body on a 304. Saves bandwidth, parse
 // work, and a 304 is lighter on the host's rate-limit budget than a 200.
 
-import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 
 const CACHE_DIR = process.env.CACHE_DIR
@@ -56,21 +56,29 @@ function fileFor(key) {
   return path.join(CACHE_DIR, h.toString(16).padStart(16, "0") + ".json");
 }
 
-function ensureDir() {
-  if (!fs.existsSync(CACHE_DIR)) {
-    try { fs.mkdirSync(CACHE_DIR, { recursive: true }); }
-    catch { /* cache disabled if dir unwritable */ }
+// ensureDir is idempotent and race-safe (mkdir recursive tolerates EEXIST).
+// Once the dir exists we skip the sync existsSync check.
+let _dirReady = false;
+async function ensureDir() {
+  if (_dirReady) return;
+  try {
+    await fsp.mkdir(CACHE_DIR, { recursive: true });
+    _dirReady = true;
+  } catch {
+    /* cache disabled if dir unwritable */
   }
 }
 
 /**
  * Read a cached value. Returns null on miss / disabled / corrupt / expired.
+ * Async because it does disk I/O — concurrent MCP tool calls no longer block
+ * the event loop on a sync read.
  * @param {string} key
- * @returns {{value:any, age:number, ttl:number, expiresAt:number, etag?:string, lastModified?:string}|null}
+ * @returns {Promise<{value:any, age:number, ttl:number, expiresAt:number, etag?:string, lastModified?:string}|null>}
  */
-export function cacheGet(key) {
+export async function cacheGet(key) {
   if (!ENABLED) return null;
-  const entry = readEntry(key);
+  const entry = await readEntry(key);
   if (!entry) return null;
   const now = Date.now();
   if (entry.expiresAt && now >= entry.expiresAt) return null; // expired
@@ -83,19 +91,23 @@ export function cacheGet(key) {
  * GET (If-None-Match / If-Modified-Since) instead of a blind refetch — on a
  * 304 the cached body is reused and the TTL refreshed.
  * @param {string} key
- * @returns {{value:any, age:number, ttl:number, expiresAt:number, etag?:string, lastModified?:string}|null}
+ * @returns {Promise<{value:any, age:number, ttl:number, expiresAt:number, etag?:string, lastModified?:string}|null>}
  */
-export function cacheGetStale(key) {
+export async function cacheGetStale(key) {
   if (!ENABLED) return null;
-  const entry = readEntry(key);
+  const entry = await readEntry(key);
   if (!entry) return null;
   if (!entry.etag && !entry.lastModified) return null; // nothing to revalidate against
   return entryView(entry, Date.now());
 }
 
-function readEntry(key) {
+async function readEntry(key) {
   let raw;
-  try { raw = fs.readFileSync(fileFor(key), "utf8"); } catch { return null; }
+  try {
+    raw = await fsp.readFile(fileFor(key), "utf8");
+  } catch {
+    return null;
+  }
   let entry;
   try { entry = JSON.parse(raw); } catch { return null; }
   if (!entry || typeof entry !== "object") return null;
@@ -118,11 +130,12 @@ function entryView(entry, now) {
  * Write a value with a TTL derived from the associated URL (or an explicit
  * ttlMs). Overwrites silently. Optional `validators` ({etag,lastModified})
  * are stored so a later expired read can drive a conditional revalidation
- * request (If-None-Match / If-Modified-Since).
+ * request (If-None-Match / If-Modified-Since). Async — fire-and-forget is
+ * safe (callers don't await unless they need ordering).
  */
-export function cacheSet(key, value, urlOrTtl, validators) {
+export async function cacheSet(key, value, urlOrTtl, validators) {
   if (!ENABLED) return;
-  ensureDir();
+  await ensureDir();
   const ttl = typeof urlOrTtl === "number" ? urlOrTtl : ttlFor(urlOrTtl || key);
   const now = Date.now();
   const entry = {
@@ -135,15 +148,15 @@ export function cacheSet(key, value, urlOrTtl, validators) {
   if (validators && validators.etag) entry.etag = validators.etag;
   if (validators && validators.lastModified) entry.lastModified = validators.lastModified;
   try {
-    fs.writeFileSync(fileFor(key), JSON.stringify(entry));
+    await fsp.writeFile(fileFor(key), JSON.stringify(entry));
   } catch { /* non-fatal: cache is advisory */ }
 }
 
 /**
  * Delete a cached entry.
  */
-export function cacheDelete(key) {
-  try { fs.unlinkSync(fileFor(key)); } catch { /* ignore */ }
+export async function cacheDelete(key) {
+  try { await fsp.unlink(fileFor(key)); } catch { /* ignore */ }
 }
 
 // Build a stable cache key for a (tool, args) pair.
@@ -176,6 +189,15 @@ export function cacheKey(tool, args) {
   // (and any nested query) so rephrasings collide.
   const normArgs = { ...(args || {}) };
   if (typeof normArgs.query === "string") normArgs.query = normalizeQuery(normArgs.query);
+  // Sort ARRAY-valued fields too: JSON.stringify preserves array element
+  // order, so engines:["baidu","bing"] and engines:["bing","baidu"] would
+  // otherwise produce different keys and miss the cache even though the
+  // multi-engine fan-out returns the same result set.
+  for (const k of Object.keys(normArgs)) {
+    if (Array.isArray(normArgs[k])) {
+      normArgs[k] = [...normArgs[k]].sort();
+    }
+  }
   const norm = JSON.stringify(normArgs, Object.keys(normArgs).sort());
   return `${tool}:${norm}`;
 }
