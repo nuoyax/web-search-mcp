@@ -177,9 +177,16 @@ server.tool(
       b.results.sort((a, c) => authorityScore(c.url) - authorityScore(a.url));
     }
 
+    const totalResults = out.reduce((n, b) => n + b.results.length, 0);
     const text = formatSearchResults(query, out, errs, { subQueries, allowed_domains, blocked_domains });
-    if (out.some((b) => b.results.length)) cacheSet(key, text, query); // fire-and-forget
-    return { content: [{ type: "text", text }] };
+    // needs_followup: low recall nudge for the caller LLM (agentic depth
+    // without an embedded LLM — server signals "not enough").
+    const followup = totalResults < 5
+      ? `> ⚠️ **needs_followup**: Low recall (${totalResults} results). Consider reformulating the query, broadening terms, or passing sub-queries via \`queries: [...]\` (Perplexity-style multi-query).`
+      : "";
+    const fullText = text + (followup ? "\n\n" + followup : "");
+    if (out.some((b) => b.results.length)) cacheSet(key, fullText, query); // fire-and-forget
+    return { content: [{ type: "text", text: fullText }] };
   },
 );
 
@@ -440,9 +447,17 @@ server.tool(
         `Engines: ${result.engines.join(", ")}`,
         `Raw: ${result.totalRaw} | Dedup: ${result.totalDedup} | Fetched OK: ${result.fetchedCount}`,
         result.errors.length ? `Engine errors: ${result.errors.map((e) => e.engine).join(", ")}` : "",
+        result.dropped?.length ? `Timed out: ${result.dropped.map((e) => e.engine).join(", ")}` : "",
+        args.allowed_domains?.length ? `Scoped to: ${args.allowed_domains.join(", ")}` : "",
+        args.blocked_domains?.length ? `Excluding: ${args.blocked_domains.join(", ")}` : "",
         "",
       ].filter(Boolean).join("\n");
-      const text = header + "\n" + result.report;
+      // needs_followup hint: when recall is low or top relevance is weak,
+      // nudge the caller LLM to reformulate / pass sub-queries. Mirrors how
+      // Perplexity-style agentic depth works without an embedded LLM: the
+      // server signals "not enough", the caller decides to iterate.
+      const followup = followupHint(result, args);
+      const text = header + "\n" + result.report + (followup ? "\n\n" + followup : "");
       cacheSet(key, text, args.query);
       return { content: [{ type: "text", text }] };
     } catch (e) {
@@ -453,6 +468,25 @@ server.tool(
     }
   },
 );
+
+// Build a needs_followup hint for low-recall / weak-relevance results.
+// Surfaces when: few deduped results (<5), few fetched OK (<2), or the top
+// result didn't come from an authoritative source. Tells the caller LLM how
+// to get more (reformulate, multi-query, domain scope) — enabling Perplexity-
+// style iterative depth driven by the caller, not an embedded LLM.
+function followupHint(result, args) {
+  const hints = [];
+  if (result.totalDedup < 5) {
+    hints.push(`Low recall (${result.totalDedup} results). Consider reformulating the query, broadening terms, or passing sub-queries via \`queries: [...]\` (Perplexity-style multi-query).`);
+  }
+  if (result.fetchedCount < 2 && result.totalDedup >= 5) {
+    hints.push(`Few full-text sources fetched (${result.fetchedCount}). Increase \`fetch_top_k\` or retry — top results may be rate-limited/paywalled.`);
+  }
+  if (hints.length) {
+    return `> ⚠️ **needs_followup**: ${hints.join(" ")}`;
+  }
+  return "";
+}
 
 // ---- main ----
 async function main() {
