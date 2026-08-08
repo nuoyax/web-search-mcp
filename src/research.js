@@ -295,6 +295,8 @@ export async function deepResearch(query, opts = {}) {
   const numPerEngine = opts.numPerEngine ?? 8;
   const fetchTopK = opts.fetchTopK ?? 4;
   const fetchChars = opts.fetchChars ?? 6_000;
+  const allowedDomains = opts.allowedDomains;
+  const blockedDomains = opts.blockedDomains;
 
   log(`query="${query}" engines=[${engineKeys.join(",")}]`);
   const { ok, errors, dropped } = await runEngines(query, engineKeys, numPerEngine, log);
@@ -318,13 +320,22 @@ export async function deepResearch(query, opts = {}) {
   const deduped = dedupe(flat);
   log(`deduped=${deduped.length}`);
 
+  // Domain scoping (mirrors Claude web_search allowed/blocked_domains). Applied
+  // after dedup so cross-engine merges are already collapsed; cheap host match.
+  const filtered = (allowedDomains?.length || blockedDomains?.length)
+    ? deduped.filter((r) => domainAllowed(r.url, allowedDomains, blockedDomains))
+    : deduped;
+  if (filtered.length !== deduped.length) {
+    log(`domain-filtered ${deduped.length}→${filtered.length}`);
+  }
+
   // Rank via Reciprocal Rank Fusion across engines. As a tiebreaker, results
   // that match query terms in the title get a small boost — this only orders
   // results with near-equal RRF scores and never overrides cross-engine
   // consensus. (This first pass has no fetched bodies yet; the full rerank
   // with authority/recency/term-density runs after the top-K fetch.)
   const queryTerms = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const ranked = deduped
+  const ranked = filtered
     .map((r) => {
       const score = rrfScore(r);
       const title = (r.title || "").toLowerCase();
@@ -401,12 +412,34 @@ export async function deepResearch(query, opts = {}) {
     query,
     engines: engineKeys,
     totalRaw: flat.length,
-    totalDedup: deduped.length,
+    totalDedup: filtered.length,
     fetchedCount: fetched.filter((f) => f.ok).length,
     errors,
     dropped,
     report,
   };
+}
+
+// Host-suffix domain filter (mirrors index.js domainAllowed). Kept local so
+// research.js has no circular dep on index.js.
+function domainAllowed(url, allowed, blocked) {
+  let host = "";
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return true; }
+  if (blocked && blocked.length) {
+    for (const d of blocked) {
+      const dl = d.toLowerCase().replace(/^\./, "");
+      if (host === dl || host.endsWith("." + dl)) return false;
+    }
+  }
+  if (allowed && allowed.length) {
+    let ok = false;
+    for (const d of allowed) {
+      const dl = d.toLowerCase().replace(/^\./, "");
+      if (host === dl || host.endsWith("." + dl)) { ok = true; break; }
+    }
+    return ok;
+  }
+  return true;
 }
 
 function composeReport({ query, engines, engineErrors, engineDropped, ranked, fetched, queryTerms }) {

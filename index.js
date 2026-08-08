@@ -17,6 +17,7 @@ import {
 } from "./src/engines.js";
 import { fetchUrl } from "./src/fetcher.js";
 import { deepResearch, raceToQuorum } from "./src/research.js";
+import { authorityScore, extractQueryTerms } from "./src/rerank.js";
 import { cacheGet, cacheGetStale, cacheSet, cacheKey, CACHE_ENABLED } from "./src/cache.js";
 
 const log = (...args) => process.stderr.write("[web-search] " + args.join(" ") + "\n");
@@ -31,16 +32,28 @@ const ENGINE_NAMES = ENGINE_LIST.map((e) => e.name);
 // ---- web_search ----
 server.tool(
   "web_search",
-  "Search the web across engines. Auto-selects CN or international engines based on the query language; international engines route through the configured proxy. Use engine='all' to fan out across every engine, or specify one (duckduckgo|bing|bingcn|baidu|sogou|so).",
+  "Search the web across engines. Auto-selects CN or international engines based on the query language; international engines route through the configured proxy. Use engine='all' to fan out across every engine, or specify one (brave|wikipedia|duckduckgo|bing|bingcn|baidu|sogou|so). Pass `queries` (array) to fan out multiple sub-queries and fuse — mirrors how Perplexity issues several searches per turn. Pass `allowed_domains`/`blocked_domains` to scope authority (mirrors Claude's web_search tool).",
   {
     query: z.string().min(1).describe("Search query"),
     num: z.number().int().min(1).max(30).default(8).describe("Max results (per engine)"),
     engine: z
       .string()
       .default("auto")
-      .describe("Engine: auto | all | duckduckgo | bing | bingcn | baidu | sogou | so"),
+      .describe("Engine: auto | all | brave | wikipedia | duckduckgo | bing | bingcn | baidu | sogou | so"),
+    queries: z
+      .array(z.string().min(1))
+      .optional()
+      .describe("Optional sub-queries to fan out and fuse (Perplexity-style multi-query). ≤3 recommended. When set, `query` is used only as the label/cache key."),
+    allowed_domains: z
+      .array(z.string())
+      .optional()
+      .describe("Only keep results whose URL host matches one of these domains (e.g. ['arxiv.org'])"),
+    blocked_domains: z
+      .array(z.string())
+      .optional()
+      .describe("Drop results whose URL host matches one of these domains"),
   },
-  async ({ query, num, engine }) => {
+  async ({ query, num, engine, queries, allowed_domains, blocked_domains }) => {
     let engineKeys;
     if (engine === "auto") engineKeys = defaultEngineOrder(query).slice(0, 2);
     else if (engine === "all") engineKeys = ENGINE_NAMES.slice();
@@ -55,8 +68,8 @@ server.tool(
     }
 
     // Cache lookup. Key excludes nothing user-visible; results from a given
-    // (query, num, engine) are stable enough to reuse across the TTL.
-    const key = cacheKey("web_search", { query, num, engine });
+    // (query, num, engine, queries, domain-filter) are stable enough to reuse.
+    const key = cacheKey("web_search", { query, num, engine, queries, allowed_domains, blocked_domains });
     const cached = await cacheGet(key);
     if (cached) {
       const ageMin = Math.round(cached.age / 60000);
@@ -68,65 +81,155 @@ server.tool(
       };
     }
 
-    // Fail-fast fan-out: resolve as soon as a quorum of engines succeeds (or
-    // one engine returns ≥ ceil(num/2) results), with a soft deadline so a
-    // dead/slow engine (e.g. DDG blocked from the egress IP, timing out at
-    // 25s) doesn't gate the fast engine (bing ~460ms). Laggards settle in the
-    // background; their eventual failure is logged, not awaited.
-    const tasks = valid.map((k) => {
-      const e = ENGINES[k];
-      const run = async () => {
-        const results = await e.search(query, { num });
-        // Resolve baidu redirect links in parallel so 8 wrapped links resolve
-        // in ~1s (concurrency-capped) instead of ~3.4s serial. The per-host
-        // token bucket still paces the actual HTTP — no extra anti-bot risk.
-        await resolveBaiduRedirects(results);
-        return { engine: k, label: e.label, favicon: e.favicon, results };
-      };
-      run.engineName = k;
-      return { name: k, run };
-    });
+    // Multi-query: when `queries` is supplied, fan out each sub-query through
+    // the same engine set, then merge. Mirrors Perplexity's num_search_queries>1.
+    // `query` (singular) is the label; `queries` drives the actual searches.
+    const subQueries = queries && queries.length ? queries : [query];
 
     const out = [];
     const errs = [];
-    const pending = new Map(tasks.map((t) => [t.name, t]));
+    const seenUrls = new Set(); // dedup across sub-queries (cheap URL dedup)
 
-    await raceToQuorum(
-      tasks.map((t) => t.run),
-      {
-        deadlineMs: 3_500,
-        minEngines: Math.min(2, tasks.length),
-        minResults: Math.max(1, Math.ceil(num / 2)),
-        onSettle: (ev) => {
-          const t = tasks[ev.index];
-          if (!t) return;
-          if (ev.status === "fulfilled" || ev.status === "late-fulfilled") {
-            out.push(ev.value);
-            pending.delete(t.name);
-          } else {
-            // rejected / late-rejected
-            errs.push(`${t.name}: ${ev.reason?.message || ev.reason}`);
-            pending.delete(t.name);
-          }
+    for (const sq of subQueries) {
+      // Fail-fast fan-out per sub-query. Resolves on quorum of engines or
+      // deadline; laggards settle in the background (logged, not awaited).
+      const tasks = valid.map((k) => {
+        const e = ENGINES[k];
+        const run = async () => {
+          const results = await e.search(sq, { num });
+          // Resolve baidu redirect links in parallel so wrapped links resolve
+          // in ~1s (concurrency-capped) instead of ~3.4s serial. The per-host
+          // token bucket still paces the actual HTTP — no extra anti-bot risk.
+          await resolveBaiduRedirects(results);
+          return { engine: k, label: e.label, favicon: e.favicon, results };
+        };
+        return { name: k, run };
+      });
+
+      const batchOut = [];
+      const batchErrs = [];
+      const pending = new Map(tasks.map((t) => [t.name, t]));
+
+      await raceToQuorum(
+        tasks.map((t) => t.run),
+        {
+          deadlineMs: 3_500,
+          minEngines: Math.min(2, tasks.length),
+          minResults: Math.max(1, Math.ceil(num / 2)),
+          onSettle: (ev) => {
+            const t = tasks[ev.index];
+            if (!t) return;
+            if (ev.status === "fulfilled" || ev.status === "late-fulfilled") {
+              batchOut.push(ev.value);
+              pending.delete(t.name);
+            } else {
+              batchErrs.push(`${t.name}: ${ev.reason?.message || ev.reason}`);
+              pending.delete(t.name);
+            }
+          },
         },
-      },
-    );
+      );
+      for (const t of pending.values()) {
+        batchErrs.push(`${t.name}: timed out (slow engine)`);
+      }
 
-    // Engines still pending at resolve time are "timed out" — record them so
-    // the user sees why an expected engine is missing.
-    for (const t of pending.values()) {
-      errs.push(`${t.name}: timed out (slow engine)`);
+      // Merge this sub-query's batches into the global `out`, deduping by
+      // normalized URL across sub-queries (cheap exact-URL dedup; SimHash
+      // near-dup is left to deep_research).
+      for (const b of batchOut) {
+        const existing = out.find((o) => o.engine === b.engine);
+        if (existing) {
+          for (const r of b.results) {
+            const k = urlDedupKey(r.url);
+            if (k && !seenUrls.has(k)) { seenUrls.add(k); existing.results.push(r); }
+          }
+        } else {
+          if (b.results.length) {
+            const filtered = [];
+            for (const r of b.results) {
+              const k = urlDedupKey(r.url);
+              if (k && seenUrls.has(k)) continue;
+              if (k) seenUrls.add(k);
+              filtered.push(r);
+            }
+            out.push({ ...b, results: filtered });
+          } else {
+            out.push(b);
+          }
+        }
+      }
+      errs.push(...batchErrs);
     }
 
-    const text = formatSearchResults(query, out, errs);
-    if (out.length) cacheSet(key, text, query); // fire-and-forget: don't block response on disk write
+    // Domain filtering (mirrors Claude web_search allowed/blocked_domains).
+    // Applied after retrieval so it's a cheap host-suffix match on the final set.
+    if (allowed_domains?.length || blocked_domains?.length) {
+      for (const b of out) {
+        b.results = b.results.filter((r) => domainAllowed(r.url, allowed_domains, blocked_domains));
+      }
+    }
+
+    // Authority rerank within each engine's batch (lightweight — no fetch).
+    // RRF fusion is deep_research's job; web_search just orders each engine's
+    // results so authoritative sources surface first within a batch.
+    const queryTerms = extractQueryTerms(query);
+    for (const b of out) {
+      b.results.sort((a, c) => authorityScore(c.url) - authorityScore(a.url));
+    }
+
+    const text = formatSearchResults(query, out, errs, { subQueries, allowed_domains, blocked_domains });
+    if (out.some((b) => b.results.length)) cacheSet(key, text, query); // fire-and-forget
     return { content: [{ type: "text", text }] };
   },
 );
 
-function formatSearchResults(query, batches, errors) {
+// Host-suffix domain filter. `allowed` wins: if set, only those hosts pass
+// (blocked still applies on top). Empty/undefined → permissive on that axis.
+function domainAllowed(url, allowed, blocked) {
+  let host = "";
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return true; }
+  if (blocked && blocked.length) {
+    for (const d of blocked) {
+      const dl = d.toLowerCase().replace(/^\./, "");
+      if (host === dl || host.endsWith("." + dl)) return false;
+    }
+  }
+  if (allowed && allowed.length) {
+    let ok = false;
+    for (const d of allowed) {
+      const dl = d.toLowerCase().replace(/^\./, "");
+      if (host === dl || host.endsWith("." + dl)) { ok = true; break; }
+    }
+    return ok;
+  }
+  return true;
+}
+
+// Cheap exact-URL dedup key across multi-query sub-queries.
+function urlDedupKey(url) {
+  try {
+    const u = new URL(url);
+    return (u.hostname + u.pathname).replace(/\/+$/, "").toLowerCase();
+  } catch {
+    return (url || "").toLowerCase();
+  }
+}
+
+function formatSearchResults(query, batches, errors, opts = {}) {
+  const { subQueries, allowed_domains, blocked_domains } = opts;
   const lines = [`# web_search: ${query}`, ""];
-  if (!batches.length) {
+  if (subQueries && subQueries.length > 1) {
+    lines.push(`_Multi-query fan-out (${subQueries.length} sub-queries): ${subQueries.map((q) => `"${q}"`).join(", ")}_`);
+    lines.push("");
+  }
+  if (allowed_domains?.length) {
+    lines.push(`_Scoped to: ${allowed_domains.join(", ")}_`);
+  }
+  if (blocked_domains?.length) {
+    lines.push(`_Excluding: ${blocked_domains.join(", ")}_`);
+  }
+  if (allowed_domains?.length || blocked_domains?.length) lines.push("");
+  if (!batches.length || !batches.some((b) => b.results.length)) {
     lines.push("_No results from any engine._");
     if (errors.length) lines.push("Errors:\n" + errors.map((e) => "- " + e).join("\n"));
     return lines.join("\n");
@@ -134,7 +237,8 @@ function formatSearchResults(query, batches, errors) {
   // Per-result source tag so the data origin of every link is explicit.
   let idx = 1;
   for (const b of batches) {
-    if (batches.length > 1) {
+    if (!b.results.length) continue;
+    if (batches.filter((x) => x.results.length).length > 1) {
       const img = b.favicon ? faviconImg(b.engine, b.label) : "";
       lines.push(`## ${img} ${b.label} (${b.results.length})`.trim());
     }
@@ -148,10 +252,11 @@ function formatSearchResults(query, batches, errors) {
     lines.push("");
   }
   // Data-source summary: which engines contributed + counts.
-  const totalResults = batches.reduce((n, b) => n + b.results.length, 0);
+  const contributing = batches.filter((b) => b.results.length);
+  const totalResults = contributing.reduce((n, b) => n + b.results.length, 0);
   lines.push(`## Data sources`);
-  lines.push(`Retrieved from ${batches.length} engine(s), ${totalResults} result(s) total:`);
-  for (const b of batches) {
+  lines.push(`Retrieved from ${contributing.length} engine(s), ${totalResults} result(s) total:`);
+  for (const b of contributing) {
     const img = b.favicon ? faviconImg(b.engine, b.label) + " " : "";
     lines.push(`- ${img}**${b.label}** — ${b.results.length} result(s)`);
   }
@@ -161,7 +266,7 @@ function formatSearchResults(query, batches, errors) {
     errors.forEach((e) => lines.push("- " + e));
   }
   lines.push("");
-  lines.push(`_Each result is tagged with its originating engine in \`[source: …]\`. Verify time-sensitive facts against the cited URL before relying on them._`);
+  lines.push(`_Each result is tagged with its originating engine in \`[source: …]\`. Results are authority-reranked within each engine. Verify time-sensitive facts against the cited URL before relying on them._`);
   return lines.join("\n");
 }
 
@@ -280,7 +385,7 @@ function parseCachedFetch(text) {
 // ---- deep_research ----
 server.tool(
   "deep_research",
-  "Multi-engine deep research: fan out across engines (auto-selects CN vs international), dedupe + rank results, fetch the top pages, and synthesize a cited markdown report. Use for thorough, multi-source research.",
+  "Multi-engine deep research: fan out across engines (auto-selects CN vs international), dedupe + rank results, fetch the top pages, rerank by authority/recency/passage-relevance, and synthesize a cited markdown report with numbered passage chunks. Use for thorough, multi-source research. Pass `allowed_domains`/`blocked_domains` to scope authority (mirrors Claude's web_search tool).",
   {
     query: z.string().min(1).describe("Research question / query"),
     engines: z
@@ -290,6 +395,14 @@ server.tool(
     num_per_engine: z.number().int().min(1).max(20).default(8),
     fetch_top_k: z.number().int().min(0).max(10).default(4),
     fetch_chars: z.number().int().min(1000).max(20000).default(6000),
+    allowed_domains: z
+      .array(z.string())
+      .optional()
+      .describe("Only keep results whose URL host matches one of these domains"),
+    blocked_domains: z
+      .array(z.string())
+      .optional()
+      .describe("Drop results whose URL host matches one of these domains"),
   },
   async (args) => {
     try {
@@ -300,6 +413,8 @@ server.tool(
         num_per_engine: args.num_per_engine,
         fetch_top_k: args.fetch_top_k,
         fetch_chars: args.fetch_chars,
+        allowed_domains: args.allowed_domains,
+        blocked_domains: args.blocked_domains,
       });
       const cached = await cacheGet(key);
       if (cached) {
@@ -316,6 +431,8 @@ server.tool(
         numPerEngine: args.num_per_engine,
         fetchTopK: args.fetch_top_k,
         fetchChars: args.fetch_chars,
+        allowedDomains: args.allowed_domains,
+        blockedDomains: args.blocked_domains,
         log,
       });
       const header = [
