@@ -100,20 +100,32 @@ function formatSearchResults(query, batches, errors) {
     if (errors.length) lines.push("Errors:\n" + errors.map((e) => "- " + e).join("\n"));
     return lines.join("\n");
   }
+  // Per-result source tag so the data origin of every link is explicit.
   let idx = 1;
   for (const b of batches) {
     if (batches.length > 1) lines.push(`## ${b.label} (${b.results.length})`);
     for (const r of b.results) {
-      lines.push(`${idx}. [${r.title || r.url}](${r.url})`);
+      const src = ` [source: ${b.label}]`;
+      lines.push(`${idx}. [${r.title || r.url}](${r.url})${src}`);
       if (r.snippet) lines.push(`   ${r.snippet.replace(/\s+/g, " ").slice(0, 240)}`);
       idx++;
     }
     lines.push("");
   }
+  // Data-source summary: which engines contributed + counts.
+  const totalResults = batches.reduce((n, b) => n + b.results.length, 0);
+  lines.push(`## Data sources`);
+  lines.push(`Retrieved from ${batches.length} engine(s), ${totalResults} result(s) total:`);
+  for (const b of batches) {
+    lines.push(`- **${b.label}** — ${b.results.length} result(s)`);
+  }
   if (errors.length) {
-    lines.push("## Errors");
+    lines.push("");
+    lines.push(`## Errors`);
     errors.forEach((e) => lines.push("- " + e));
   }
+  lines.push("");
+  lines.push(`_Each result is tagged with its originating engine in \`[source: …]\`. Verify time-sensitive facts against the cited URL before relying on them._`);
   return lines.join("\n");
 }
 
@@ -193,6 +205,8 @@ function finishFetch(result, url, key) {
     `# ${result.title || url}`,
     `URL: ${url}`,
     `Status: ${result.status} | Proxy: ${result.useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`,
+    "",
+    `_Data source: fetched directly from the URL above by this MCP server (no third-party search index involved)._`,
     "",
   ].join("\n");
   const text = header + (result.markdown || "");

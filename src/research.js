@@ -288,7 +288,8 @@ function composeReport({ query, engines, engineErrors, ranked, fetched }) {
       .filter((p) => p.length > 60);
     const excerpt = paras.slice(0, 2).join(" ").slice(0, 500);
     if (excerpt) {
-      synthesized.push(excerpt + ` [${f.title || f.url}](${f.url})`);
+      // Cite with the source title + URL so the data origin is explicit.
+      synthesized.push(excerpt + ` — [${f.title || f.url}](${f.url})`);
     }
   }
   if (synthesized.length) {
@@ -298,25 +299,47 @@ function composeReport({ query, engines, engineErrors, ranked, fetched }) {
   }
   lines.push("");
 
-  // All results list.
+  // All results list. Each item tagged with its originating engine(s).
   lines.push("## Sources");
   ranked.slice(0, 15).forEach((r, i) => {
-    const src = r.sources ? ` [${r.sources.join(",")}]` : "";
+    const src = r.sources && r.sources.length ? ` [source: ${r.sources.join(", ")}]` : "";
     lines.push(`${i + 1}. [${r.title || r.url}](${r.url})${src}`);
     if (r.snippet) lines.push(`   ${r.snippet.replace(/\n+/g, " ").slice(0, 240)}`);
   });
   lines.push("");
 
-  // Detailed fetched content (truncated).
+  // Detailed fetched content (truncated). Each block labeled with its source.
   lines.push("## Fetched content");
   for (const f of fetched.filter((x) => x.ok && x.markdown)) {
-    lines.push(`### ${f.title || f.url}`);
+    const srcLabel = f.sources && f.sources.length ? ` (source: ${f.sources.join(", ")})` : "";
+    lines.push(`### ${f.title || f.url}${srcLabel}`);
     lines.push(`URL: ${f.url}`);
     lines.push("");
     const body = f.markdown.slice(0, 2500);
     lines.push(body);
     lines.push("");
   }
+
+  // Data-source summary so the origin of the synthesized answer is explicit.
+  lines.push("## Data sources");
+  lines.push(`Retrieved from ${engines.length} engine(s)${engineErrors.length ? ` (${engineErrors.length} failed)` : ""}.`);
+  lines.push("");
+  // Engine -> result count (from ranked sources) + fetch status.
+  const byEngine = new Map();
+  for (const r of ranked) {
+    for (const e of r.sources || []) {
+      byEngine.set(e, (byEngine.get(e) || 0) + 1);
+    }
+  }
+  for (const eng of engines) {
+    const cnt = byEngine.get(eng) ?? 0;
+    const failed = engineErrors.some((e) => e.engine === eng);
+    lines.push(`- **${eng}** — ${cnt} result(s)${failed ? " (failed)" : ""}`);
+  }
+  const fetchedOk = fetched.filter((f) => f.ok).length;
+  lines.push("");
+  lines.push(`Full text fetched for ${fetchedOk}/${fetched.length} top result(s). Every cited source above is tagged with its originating engine.`);
+  lines.push("");
 
   return lines.join("\n");
 }
