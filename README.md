@@ -21,7 +21,7 @@ A self-hosted **web search MCP server** for Claude Code / any MCP client. Multi-
   pip install curl_cffi
   ```
 
-- A proxy on `127.0.0.1:7890` (e.g. Clash) — set `PROXY_URL=""` to disable.
+- A proxy on `127.0.0.1:7890` (e.g) — set `PROXY_URL=""` to disable.
 
 ### Build
 
