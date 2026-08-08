@@ -10,6 +10,59 @@ A self-hosted **web search MCP server** for Claude Code / any MCP client. Multi-
 
 ---
 
+## Installation
+
+### Prerequisites
+
+- **Node.js ≥ 18**
+- **Python 3** + `curl_cffi` (optional, for TLS impersonation on protected sites):
+
+  ```bash
+  pip install curl_cffi
+  ```
+
+- A proxy on `127.0.0.1:7890` (e.g. Clash) — set `PROXY_URL=""` to disable.
+
+### Build
+
+```bash
+git clone git@github.com:nuoyax/web-search-mcp.git
+cd web-search-mcp
+npm install
+```
+
+### Wire into Claude Code
+
+User-level (available in all projects):
+
+```bash
+claude mcp add web-search -s user -e PROXY_URL=http://127.0.0.1:7890 \
+  -- node /absolute/path/to/web-search-mcp/index.js
+```
+
+Or add to `.mcp.json` (project-level):
+
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["/absolute/path/to/web-search-mcp/index.js"],
+      "env": { "PROXY_URL": "http://127.0.0.1:7890" }
+    }
+  }
+}
+```
+
+### Verify
+
+```bash
+node index.js          # start the MCP server (stdio)
+node test-smoke.js     # smoke test every engine + fetch
+```
+
+---
+
 ## Highlights
 
 - **6 engines** — DuckDuckGo / Bing (international, via proxy) + Bing CN / Baidu / Sogou / 360 (direct). Auto-selected by query language.
@@ -207,58 +260,6 @@ Multi-engine fan-out → dedup & RRF rank → fetch top-K → cited markdown rep
 
 ---
 
-## Installation
-
-### Prerequisites
-
-- **Node.js ≥ 18**
-- **Python 3** + `curl_cffi` (optional, for TLS impersonation on protected sites):
-
-  ```bash
-  pip install curl_cffi
-  ```
-
-- A proxy on `127.0.0.1:7890` (e.g. Clash) — set `PROXY_URL=""` to disable.
-
-### Build
-
-```bash
-git clone git@github.com:nuoyax/web-search-mcp.git
-cd web-search-mcp
-npm install
-```
-
-### Wire into Claude Code
-
-User-level (available in all projects):
-
-```bash
-claude mcp add web-search -s user -e PROXY_URL=http://127.0.0.1:7890 \
-  -- node /absolute/path/to/web-search-mcp/index.js
-```
-
-Or add to `.mcp.json` (project-level):
-
-```json
-{
-  "mcpServers": {
-    "web-search": {
-      "command": "node",
-      "args": ["/absolute/path/to/web-search-mcp/index.js"],
-      "env": { "PROXY_URL": "http://127.0.0.1:7890" }
-    }
-  }
-}
-```
-
-### Verify
-
-```bash
-node index.js          # start the MCP server (stdio)
-node test-smoke.js     # smoke test every engine + fetch
-```
-
----
 
 ## Environment variables
 

@@ -10,6 +10,59 @@
 
 ---
 
+## 安装
+
+### 前置
+
+- **Node.js ≥ 18**
+- **Python 3** + `curl_cffi`（可选，用于强风控站点的 TLS 伪装）：
+
+  ```bash
+  pip install curl_cffi
+  ```
+
+- `127.0.0.1:7890` 上的代理（如 Clash）——设 `PROXY_URL=""` 可禁用。
+
+### 构建
+
+```bash
+git clone git@github.com:nuoyax/web-search-mcp.git
+cd web-search-mcp
+npm install
+```
+
+### 接入 Claude Code
+
+用户级（所有项目可用）：
+
+```bash
+claude mcp add web-search -s user -e PROXY_URL=http://127.0.0.1:7890 \
+  -- node /absolute/path/to/web-search-mcp/index.js
+```
+
+或加到 `.mcp.json`（项目级）：
+
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["/absolute/path/to/web-search-mcp/index.js"],
+      "env": { "PROXY_URL": "http://127.0.0.1:7890" }
+    }
+  }
+}
+```
+
+### 验证
+
+```bash
+node index.js          # 启动 MCP server（stdio）
+node test-smoke.js     # 各引擎 + fetch 冒烟测试
+```
+
+---
+
 ## 特性
 
 - **6 引擎** — DuckDuckGo / Bing（国际，走代理）+ Bing 中国版 / 百度 / 搜狗 / 360（直连）。按查询语言自动选择。
@@ -204,59 +257,6 @@ flowchart TB
 ```
 
 多引擎并发 → 去重排序 → 抓取正文 → 带引用 markdown 报告。
-
----
-
-## 安装
-
-### 前置
-
-- **Node.js ≥ 18**
-- **Python 3** + `curl_cffi`（可选，用于强风控站点的 TLS 伪装）：
-
-  ```bash
-  pip install curl_cffi
-  ```
-
-- `127.0.0.1:7890` 上的代理（如 Clash）——设 `PROXY_URL=""` 可禁用。
-
-### 构建
-
-```bash
-git clone git@github.com:nuoyax/web-search-mcp.git
-cd web-search-mcp
-npm install
-```
-
-### 接入 Claude Code
-
-用户级（所有项目可用）：
-
-```bash
-claude mcp add web-search -s user -e PROXY_URL=http://127.0.0.1:7890 \
-  -- node /absolute/path/to/web-search-mcp/index.js
-```
-
-或加到 `.mcp.json`（项目级）：
-
-```json
-{
-  "mcpServers": {
-    "web-search": {
-      "command": "node",
-      "args": ["/absolute/path/to/web-search-mcp/index.js"],
-      "env": { "PROXY_URL": "http://127.0.0.1:7890" }
-    }
-  }
-}
-```
-
-### 验证
-
-```bash
-node index.js          # 启动 MCP server（stdio）
-node test-smoke.js     # 各引擎 + fetch 冒烟测试
-```
 
 ---
 
