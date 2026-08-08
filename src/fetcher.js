@@ -1,8 +1,17 @@
 // fetch_url: download a page, strip boilerplate, convert HTML to markdown.
 // Falls back to TLS-impersonating curl_cffi when undici gets 403/blocked.
+//
+// Content extraction: Mozilla Readability (Firefox's reader mode, the de-facto
+// open-source standard used by Tavily/Exa-class answer engines) is the primary
+// extractor; the density-based fallback (shallow-text-features boilerplate
+// detection) covers pages Readability gives up on (table layouts, forums,
+// listicles with no <article> semantics). Readability also yields
+// `publishedTime`, which feeds the recency rerank signal.
 
 import * as cheerio from "cheerio";
 import TurndownService from "turndown";
+import { JSDOM } from "jsdom";
+import { Readability } from "@mozilla/readability";
 import { httpGet, waitForBucket, releaseBucket, coolHost } from "./http.js";
 import { curlFetch, curlAvailable, needsImpersonation } from "./tlsbypass.js";
 
@@ -14,52 +23,100 @@ const turndown = new TurndownService({
 });
 turndown.remove(["script", "style", "noscript", "iframe", "svg", "nav", "footer", "form", "button"]);
 
-// Parse HTML into {title, markdown}; shared between the undici and curl_cffi
-// code paths so both go through identical boilerplate stripping.
-// Exported for unit testing of the density fallback (§7.2-F).
+// Parse HTML into {title, markdown, publishedTime}; shared between the undici
+// and curl_cffi code paths so both go through identical extraction.
+// Primary path: Mozilla Readability (Firefox reader mode — the open-source
+// standard for main-content extraction). Fallback: density-based extraction
+// (shallow-text-features) for pages Readability can't parse (table layouts,
+// forums, listicles). Exported for unit testing of the extraction paths.
+//
+// `publishedTime` comes out of Readability for free (it reads
+// <meta property="article:published_time"> + JSON-LD datePublished). It feeds
+// the recency rerank signal downstream; null when not found.
 export function htmlToMarkdown(text, url, contentType, useProxy, maxChars) {
   const ct = (contentType || "").toLowerCase();
   const isHtml = ct.includes("html") || /^\s*<!doctype html|<html/i.test(text);
 
   if (!isHtml) {
     const body = text.length > maxChars ? text.slice(0, maxChars) + "\n...[truncated]" : text;
-    return { ok: true, url, contentType, useProxy, title: "", markdown: body };
+    return { ok: true, url, contentType, useProxy, title: "", markdown: body, publishedTime: null };
   }
 
-  const $ = cheerio.load(text);
-  const title = $("title").first().text().trim() || $('meta[property="og:title"]').attr("content") || "";
-
-  // Remove boilerplate.
-  $(
-    "script, style, noscript, iframe, nav, footer, header[role=banner], aside, form, button, .ad, .ads, .advertisement, .sidebar, .related, .comments, .comment-list, .share, .social, [aria-hidden=true], .navbox, .vertical-navbox, #p-lang-btn, .vector-dropdown",
-  ).remove();
-
-  // Step 1 — try semantic content selectors (fast path). Most-specific first:
-  // Wikipedia's Vector skin wraps the article + lang sidebar in <main id="content">,
-  // so we drill into #bodyContent (article body only) before the wider main/#content.
-  // Generic .content is last so it doesn't shadow better candidates.
-  let root = $("#bodyContent, .mw-parser-output").first();
-  if (!root.length) {
-    root = $(
-      "main, article, [role=main], #content, .post-content, .article-content, .entry-content, .content",
-    ).first();
+  // Primary extractor: Readability over a WHATWG DOM (jsdom). Readability
+  // returns {title, content(HTML), textContent, excerpt, publishedTime, ...}
+  // or null when it can't identify a main article. We convert its HTML
+  // `content` to markdown via turndown (already installed).
+  let publishedTime = null;
+  let title = "";
+  let md = "";
+  let readabilityParsed = false;
+  try {
+    const dom = new JSDOM(text, { url });
+    const article = new Readability(dom.window.document.cloneNode(true)).parse();
+    if (article && article.content && (article.textContent || "").trim().length >= 500) {
+      title = (article.title || "").trim();
+      md = turndown.turndown(article.content);
+      publishedTime = article.publishedTime || null;
+      readabilityParsed = true;
+    }
+  } catch {
+    // Readability threw (rare, malformed DOM) — fall through to density path.
   }
 
-  // Step 2 — density-based fallback (shallow text features, Spinkens & Leonhard
-  // WSDM 2010 [10.1145/1718487.1718542]; node-characteristics density from
-  // Nguyen 2017 [10.5626/jcse.2017.11.2.39]). When the selectors miss we score
-  // each candidate block by text density (text chars vs tag overhead) and link
-  // density (anchor text share), picking the best contiguous run. This avoids
-  // dumping the whole <body> (nav/ad noise) into downstream SimHash/LLM.
-  const target = root.length ? root : extractByDensity($, $("body"));
+  // Fallback: density-based extraction (shallow text features). Covers pages
+  // Readability gives up on: legacy table layouts, forums, listicles.
+  if (!md) {
+    const $ = cheerio.load(text);
+    title = $("title").first().text().trim() || $('meta[property="og:title"]').attr("content") || "";
+    publishedTime = publishedTime || extractPublishedTime($, text);
+    $(
+      "script, style, noscript, iframe, nav, footer, header[role=banner], aside, form, button, .ad, .ads, .advertisement, .sidebar, .related, .comments, .comment-list, .share, .social, [aria-hidden=true], .navbox, .vertical-navbox, #p-lang-btn, .vector-dropdown",
+    ).remove();
+    let root = $("#bodyContent, .mw-parser-output").first();
+    if (!root.length) {
+      root = $(
+        "main, article, [role=main], #content, .post-content, .article-content, .entry-content, .content",
+      ).first();
+    }
+    const target = root.length ? root : extractByDensity($, $("body"));
+    const html = (target && target.length ? target.html() : null) || $("body").html() || text;
+    md = turndown.turndown(html);
+  } else if (!publishedTime) {
+    // Readability succeeded but didn't surface a publish date (it only reads
+    // <meta article:published_time>, not JSON-LD datePublished). Try the
+    // meta/JSON-LD extractor as a second pass on the original HTML.
+    try {
+      const $ = cheerio.load(text);
+      publishedTime = extractPublishedTime($, text);
+    } catch { /* best-effort */ }
+  }
 
-  let html = (target && target.length ? target.html() : null) || $("body").html() || text;
-
-  let md = turndown.turndown(html);
   md = md.replace(/\n{3,}/g, "\n\n").trim();
   if (md.length > maxChars) md = md.slice(0, maxChars) + "\n\n...[truncated]";
 
-  return { ok: true, url, contentType, useProxy, title, markdown: md };
+  return { ok: true, url, contentType, useProxy, title, markdown: md, publishedTime };
+}
+
+// Extract a publish date from <meta> tags or JSON-LD when Readability didn't.
+// Feeds the recency rerank signal. Best-effort; returns ISO string or null.
+function extractPublishedTime($, text) {
+  const meta =
+    $('meta[property="article:published_time"]').attr("content") ||
+    $('meta[property="og:article:published_time"]').attr("content") ||
+    $('meta[name="date"]').attr("content") ||
+    $('meta[itemprop="datePublished"]').attr("content");
+  if (meta) return meta;
+  // JSON-LD datePublished (first match).
+  const ld = $("script[type='application/ld+json']").first().text();
+  if (ld) {
+    try {
+      const obj = JSON.parse(ld);
+      const node = Array.isArray(obj) ? obj[0] : obj;
+      const dp = node?.datePublished || node?.dateCreated || node?.mainEntity?.datePublished;
+      if (dp) return dp;
+    } catch { /* malformed JSON-LD */ }
+  }
+  return null;
 }
 
 // Density-based main-content extraction. Walks block children of the given
@@ -243,6 +300,7 @@ export async function fetchUrl(url, opts = {}) {
           markdown,
           useProxy: cb.useProxy ?? false,
           notModified: true,
+          publishedTime: cb.publishedTime || null,
           validators: pickValidators(headers),
         };
       }

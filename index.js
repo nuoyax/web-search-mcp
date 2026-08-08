@@ -195,23 +195,18 @@ server.tool(
       // and refresh TTL; on a fresh 200 we replace the entry with new validators.
       const stale = await cacheGetStale(key);
       if (stale && stale.value && (stale.etag || stale.lastModified)) {
-        const { title, useProxy, markdown } = parseCachedFetch(stale.value);
+        const { title, useProxy, markdown, publishedTime } = parseCachedFetch(stale.value);
         const result = await fetchUrl(url, {
           maxChars: max_chars,
           validators: { etag: stale.etag, lastModified: stale.lastModified },
-          cachedBody: { title, useProxy, markdown },
+          cachedBody: { title, useProxy, markdown, publishedTime },
         });
         if (result.notModified) {
           const ageMin = Math.round(stale.age / 60000);
           log(`fetch_url 304 NOT MODIFIED (reuse body, age ${ageMin}min) for: ${url}`);
           // Body unchanged; refresh TTL + validators.
           cacheSet(key, stale.value, url, result.validators);
-          const header = [
-            `# ${title || url}`,
-            `URL: ${url}`,
-            `Status: 304 (revalidated) | Proxy: ${useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`,
-            "",
-          ].join("\n");
+          const header = buildFetchHeader(title || url, url, "304 (revalidated)", useProxy, result.impersonated, publishedTime);
           return { content: [{ type: "text", text: header + markdown }] };
         }
         // Fresh 200 (or fallback) — replace cache + format normally.
@@ -229,6 +224,21 @@ server.tool(
   },
 );
 
+// Build the fetch_url header block (title/URL/status/proxy/TLS/publishedTime).
+// Shared by the fresh-fetch and 304-revalidated paths so the header format
+// (including publishedTime) stays consistent and parseable by parseCachedFetch.
+function buildFetchHeader(title, url, statusLine, useProxy, impersonated, publishedTime) {
+  const tls = impersonated ? "impersonated (curl_cffi)" : "native (undici)";
+  const parts = [
+    `# ${title}`,
+    `URL: ${url}`,
+    `Status: ${statusLine} | Proxy: ${useProxy ? "yes" : "no (direct)"} | TLS: ${tls}`,
+  ];
+  if (publishedTime) parts.push(`Published: ${publishedTime}`);
+  parts.push("", "_Data source: fetched directly from the URL above by this MCP server (no third-party search index involved)._", "");
+  return parts.join("\n");
+}
+
 // Shared finish path: format + cache a (possibly failed) fetch result.
 function finishFetch(result, url, key) {
   if (!result.ok) {
@@ -237,35 +247,34 @@ function finishFetch(result, url, key) {
       content: [{ type: "text", text: `Fetch failed: ${result.error || "HTTP " + result.status} for ${url}` }],
     };
   }
-  const header = [
-    `# ${result.title || url}`,
-    `URL: ${url}`,
-    `Status: ${result.status} | Proxy: ${result.useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`,
-    "",
-    `_Data source: fetched directly from the URL above by this MCP server (no third-party search index involved)._`,
-    "",
-  ].join("\n");
+  const statusLine = `${result.status} | Proxy: ${result.useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`.split(" | ");
+  // Reuse buildFetchHeader for format consistency.
+  const header = buildFetchHeader(
+    result.title || url, url, result.status, result.useProxy, result.impersonated, result.publishedTime,
+  );
   const text = header + (result.markdown || "");
   if (result.markdown) cacheSet(key, text, url, result.validators);
   return { content: [{ type: "text", text }] };
 }
 
-// Recover the title/useProxy/body from a cached fetch_url text blob. The
-// cached blob is exactly what we return to the client (header + markdown),
-// so we re-parse the prefix lines we wrote.
+// Recover the title/useProxy/body/publishedTime from a cached fetch_url text
+// blob. The cached blob is exactly what we return to the client (header +
+// markdown), so we re-parse the prefix lines we wrote.
 function parseCachedFetch(text) {
   const lines = (text || "").split("\n");
   let title = "";
   let useProxy = false;
+  let publishedTime = null;
   let bodyStart = 0;
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     if (l.startsWith("# ")) title = l.slice(2).trim();
     else if (l.startsWith("Status:") && /Proxy:\s*yes/.test(l)) useProxy = true;
+    else if (l.startsWith("Published:")) publishedTime = l.slice("Published:".length).trim();
     if (l === "") { bodyStart = i + 1; break; }
   }
   const markdown = lines.slice(bodyStart).join("\n");
-  return { title, useProxy, markdown };
+  return { title, useProxy, markdown, publishedTime };
 }
 
 // ---- deep_research ----
