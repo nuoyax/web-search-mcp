@@ -1,0 +1,4 @@
+version: "3.0.0"
+sequence:
+  - read: .claude/planner/graph/task-graph.json
+  - read: .claude/runtime/checkpoints/latest.json

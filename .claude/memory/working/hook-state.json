@@ -1,0 +1,11 @@
+{
+  "boot_injected": true,
+  "graph_hash": "4602b0bb0270",
+  "pending_snapshot": {},
+  "inject_mode": "minimal",
+  "session_source": "startup",
+  "recovery_injected": false,
+  "recovery_consumed": false,
+  "last_injected_at": "2026-08-08T02:51:56.691Z",
+  "turn_count": 2
+}

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["D:\\agents\\web_search\\index.js"],
+      "env": {
+        "PROXY_URL": "http://127.0.0.1:7890"
+      }
+    }
+  }
+}

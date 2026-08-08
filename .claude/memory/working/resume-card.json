@@ -1,0 +1,18 @@
+{
+  "updated_at": "2026-08-08T02:51:56.693Z",
+  "interrupted": false,
+  "scenario": "fresh_start",
+  "epic_id": null,
+  "project_id": null,
+  "task_id": null,
+  "task_title": null,
+  "task_status": null,
+  "task_step": null,
+  "loop_step": null,
+  "loop_iteration": null,
+  "last_prompt": "搜索目前国际论文，有没有更好的方案或者架构去优化。目标更快的速度搜索更多的信息，还有频繁访问的检测问题等等常见的问题，搜索论文去解决",
+  "phase": null,
+  "next_actions": [],
+  "resume_action": "按用户新请求规划下一 Task",
+  "turn_count": 2
+}

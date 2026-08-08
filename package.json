@@ -1,0 +1,24 @@
+{
+  "name": "web-search-mcp",
+  "version": "1.0.0",
+  "description": "Self-hosted web search MCP server (multi-engine CN/Intl, auto-proxy, fetch + deep research).",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "web-search-mcp": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.19.1",
+    "cheerio": "^1.1.0",
+    "turndown": "^7.2.0",
+    "undici": "^7.0.0",
+    "zod": "^3.24.1"
+  }
+}

@@ -1,0 +1,112 @@
+{
+  "version": "3.0",
+  "meta": {
+    "project_id": "web_search",
+    "updated_at": "2026-08-08T02:51:56.693Z",
+    "epic_id": "EPIC-001"
+  },
+  "nodes": {
+    "EPIC-001": {
+      "id": "EPIC-001",
+      "title": "搜索目前国际论文，有没有更好的方案或者架构去优化。目标更快的速度搜索更多的信息，还有频繁访问的检测问题等等常见的问题，搜索论文去解决",
+      "owner": "planner-kernel",
+      "priority": 100,
+      "status": "IN_PROGRESS",
+      "dependencies": [],
+      "children": [
+        "TASK-000",
+        "TASK-001"
+      ],
+      "context": {
+        "scope_paths": [
+          "src/**",
+          "tests/**"
+        ],
+        "acceptance": [
+          "Bootstrap 完成",
+          "首个可交付 Task 完成"
+        ],
+        "workflow": "feature-dev",
+        "tags": [
+          "bootstrap"
+        ]
+      },
+      "retry_count": 0,
+      "max_retries": 3,
+      "blocked_reason": null,
+      "file_locks": [],
+      "created_at": "2026-08-08T02:51:56.693Z",
+      "updated_at": "2026-08-08T02:51:56.693Z"
+    },
+    "TASK-000": {
+      "id": "TASK-000",
+      "title": "Project Bootstrap",
+      "owner": "planner-kernel",
+      "priority": 100,
+      "status": "DONE",
+      "dependencies": [],
+      "children": [],
+      "context": {
+        "acceptance": [
+          ".claude 骨架",
+          "README",
+          "git init"
+        ],
+        "workflow": "feature-dev",
+        "tags": []
+      },
+      "retry_count": 0,
+      "max_retries": 3,
+      "blocked_reason": null,
+      "file_locks": [],
+      "created_at": "2026-08-08T02:51:56.693Z",
+      "updated_at": "2026-08-08T02:51:56.693Z"
+    },
+    "TASK-001": {
+      "id": "TASK-001",
+      "title": "搜索目前国际论文，有没有更好的方案或者架构去优化。目标更快的速度搜索更多的信息，还有频繁访问的检测问题等等常见的问题，搜索论文去解决",
+      "owner": "planner-kernel",
+      "priority": 95,
+      "status": "READY",
+      "dependencies": [
+        "TASK-000"
+      ],
+      "children": [],
+      "context": {
+        "scope_paths": [
+          "src/**"
+        ],
+        "acceptance": [
+          "搜索目前国际论文，有没有更好的方案或者架构去优化。目标更快的速度搜索更多的信息，还有频繁访问的检测问题等等常见的问题，搜索论文去解决"
+        ],
+        "workflow": "feature-dev",
+        "tags": [
+          "mvp"
+        ]
+      },
+      "retry_count": 0,
+      "max_retries": 3,
+      "blocked_reason": null,
+      "file_locks": [],
+      "created_at": "2026-08-08T02:51:56.693Z",
+      "updated_at": "2026-08-08T02:51:56.693Z"
+    }
+  },
+  "edges": [
+    {
+      "from": "EPIC-001",
+      "to": "TASK-000",
+      "type": "parent"
+    },
+    {
+      "from": "EPIC-001",
+      "to": "TASK-001",
+      "type": "parent"
+    },
+    {
+      "from": "TASK-000",
+      "to": "TASK-001",
+      "type": "blocks"
+    }
+  ]
+}
