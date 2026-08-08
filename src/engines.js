@@ -324,12 +324,18 @@ async function searchSo(query, { num = 10 } = {}) {
 export async function resolveBaiduRedirect(baiduUrl) {
   if (!/baidu\.com\/link\?url=/.test(baiduUrl)) return baiduUrl;
   try {
-    const { text, status } = await httpGet(baiduUrl, {
+    // maxRedirections:0 → a 302 returns the Location header without following.
+    // Prefer the Location header (authoritative) before falling back to regex
+    // on the body (older mobile endpoints sometimes return a JS/meta refresh).
+    const { text, status, headers } = await httpGet(baiduUrl, {
       forceDirect: true,
       maxRedirections: 0,
       timeoutMs: 10_000,
     });
-    if (status >= 300 && status < 400) return baiduUrl; // no Location exposed here
+    if (status >= 300 && status < 400 && headers?.location) {
+      return headers.location;
+    }
+    if (status >= 300 && status < 400) return baiduUrl; // 3xx w/o Location
     const m = /URL=['"]?(https?:\/\/[^'"\s<>]+)/i.exec(text);
     if (m) return m[1];
     const m2 = /window\.location\.replace\(["']?(https?:\/\/[^"')\s]+)/i.exec(text);

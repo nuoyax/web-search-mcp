@@ -3,7 +3,7 @@
 
 import * as cheerio from "cheerio";
 import TurndownService from "turndown";
-import { httpGet } from "./http.js";
+import { httpGet, waitForBucket, releaseBucket, coolHost } from "./http.js";
 import { curlFetch, curlAvailable, needsImpersonation } from "./tlsbypass.js";
 
 const turndown = new TurndownService({
@@ -180,6 +180,25 @@ function extractByDensity($, $body) {
   return null;
 }
 
+// Acquire the per-host token bucket around a curl_cffi call so the TLS
+// fallback shares the SAME politeness as the undici path. Hard-case hosts
+// (HARDCASE_HOSTS) are the most aggressively rate-limited — without this, the
+// deep_research semaphore (concurrency 4) could fire 4 concurrent curl_cffi
+// processes at one host and trip the very anti-bot signal we're avoiding.
+async function curlFetchThrottled(url, opts) {
+  const host = hostKeyFor(url);
+  await waitForBucket(host, opts);
+  try {
+    return await curlFetch(url, opts);
+  } finally {
+    releaseBucket(host);
+  }
+}
+
+function hostKeyFor(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch { return url; }
+}
+
 /**
  * Fetch a URL and return cleaned-up markdown + metadata.
  * Strategy: undici first (fast, native). On 403/blocked, or for sites known
@@ -233,7 +252,7 @@ export async function fetchUrl(url, opts = {}) {
 
       // 403 / 429 → try impersonation fallback (if available).
       if ((status === 403 || status === 429) && (await curlAvailable())) {
-        const imp = await curlFetch(url, opts);
+        const imp = await curlFetchThrottled(url, opts);
         if (imp.ok && imp.status != null && imp.status < 400) {
           return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars), notModified: false, validators: pickValidators(imp.headers) };
         }
@@ -248,7 +267,7 @@ export async function fetchUrl(url, opts = {}) {
     } catch (e) {
       // Network error — also try impersonation fallback before giving up.
       if (await curlAvailable()) {
-        const imp = await curlFetch(url, opts);
+        const imp = await curlFetchThrottled(url, opts);
         if (imp.ok && imp.status < 400) {
           return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars), notModified: false, validators: pickValidators(imp.headers) };
         }
@@ -259,7 +278,7 @@ export async function fetchUrl(url, opts = {}) {
 
   // Known hard-case host: go straight to curl_cffi.
   if (await curlAvailable()) {
-    const imp = await curlFetch(url, opts);
+    const imp = await curlFetchThrottled(url, opts);
     if (imp.ok && imp.status < 400) {
       // curl_cffi returns 304 only if it followed a conditional request; we
       // don't pass validators to curl_cffi, so treat any success as a fresh 200.

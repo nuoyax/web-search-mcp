@@ -42,10 +42,15 @@ function ttlFor(url) {
 
 // Stable filename from a key string.
 function fileFor(key) {
-  // FNV-1a 64 of key -> hex; keeps filenames short and filesystem-safe.
+  // FNV-1a 64 over the key's UTF-8 bytes. Iterating UTF-16 code units with
+  // `& 0xff` (the old form) collapses CJK chars that differ only in the high
+  // byte — e.g. "一" (U+4E00) and "渀" (U+6E00) both fed 0x00, so two
+  // different single-char CN queries hashed to the same file → stale HIT with
+  // the wrong results. UTF-8 bytes make every distinct string distinct.
+  const bytes = Buffer.from(key, "utf8");
   let h = 0xcbf29ce484222325n;
-  for (let i = 0; i < key.length; i++) {
-    h ^= BigInt(key.charCodeAt(i) & 0xff);
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= BigInt(bytes[i]);
     h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
   }
   return path.join(CACHE_DIR, h.toString(16).padStart(16, "0") + ".json");

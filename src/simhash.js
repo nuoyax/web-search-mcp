@@ -9,10 +9,15 @@
 const MASK64 = 0xffffffffffffffffn;
 
 // Cheap non-crypto 64-bit hash (FNV-1a 64) of a string -> BigInt.
+// Iterates UTF-8 bytes, not UTF-16 code units: masking `charCodeAt(i) & 0xff`
+// collapses CJK chars that share a low byte (e.g. U+4E00 and U+6E00 both feed
+// 0x00), which would let near-duplicate CJK snippets hash identically and
+// merge wrongly. UTF-8 bytes keep every distinct string distinct.
 function fnv1a64(str) {
+  const bytes = Buffer.from(str, "utf8");
   let h = 0xcbf29ce484222325n;
-  for (let i = 0; i < str.length; i++) {
-    h ^= BigInt(str.charCodeAt(i) & 0xff);
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= BigInt(bytes[i]);
     h = (h * 0x100000001b3n) & MASK64;
   }
   return h;

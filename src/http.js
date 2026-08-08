@@ -138,17 +138,26 @@ function waitForBucket(host, opts) {
     const tryAcquire = () => {
       const now = Date.now();
       const sinceLast = now - b.lastReqAt;
-      const need = b.active >= maxConc ? false : sinceLast >= minInterval;
+      // Respect a host-level cooldown (set after a Retry-After / transient
+      // backoff): even if a slot is free and the minInterval has elapsed, we
+      // hold all same-host requests until the cooldown window passes. Without
+      // this, a queued same-host request would fire during the backoff sleep
+      // and defeat the point of backing off.
+      const cooling = b.cooldownUntil && now < b.cooldownUntil;
+      const need = b.active >= maxConc ? false : (sinceLast >= minInterval && !cooling);
       if (need) {
         b.active++;
         b.lastReqAt = now;
         resolve();
       } else {
-        // re-check when either a slot frees or the interval elapses.
-        const waitMs = Math.max(0, minInterval - sinceLast);
+        // re-check when either a slot frees, the interval elapses, or the
+        // cooldown ends — whichever is soonest.
+        const waitInterval = Math.max(0, minInterval - sinceLast);
+        const waitCooldown = cooling ? Math.max(0, b.cooldownUntil - now) : 0;
+        const waitMs = cooling ? waitCooldown : Math.max(waitInterval, waitCooldown);
         b.queue.push(tryAcquire);
         if (b.active < maxConc) {
-          // idle waiting on interval; schedule a wake
+          // idle waiting on interval/cooldown; schedule a wake.
           setTimeout(() => {
             const fn = b.queue.shift();
             if (fn) fn();
@@ -167,6 +176,21 @@ function releaseBucket(host) {
   const next = b.queue.shift();
   if (next) next();
 }
+
+// Mark a host as in cooldown until `until` (ms timestamp). Called after a
+// transient (429/5xx) response that carries Retry-After, or an exponential
+// backoff, so queued same-host requests wait rather than firing during the
+// backoff window. Exported so the curl_cffi path (tlsbypass.js) can share the
+// same per-host politeness as the undici path.
+export function coolHost(host, until) {
+  const b = acquireBucket(host);
+  if (!until || until <= Date.now()) return;
+  if (!b.cooldownUntil || until > b.cooldownUntil) b.cooldownUntil = until;
+}
+
+// Exported so the curl_cffi fallback (tlsbypass.js) routes through the SAME
+// per-host token bucket as undici — hard-case hosts need politeness most.
+export { waitForBucket, releaseBucket };
 
 // Sleep helper that tolerates falsy ms.
 function sleep(ms) {
@@ -244,6 +268,10 @@ export async function httpGet(url, opts = {}) {
         // Network errors (timeout/reset) are transient too.
         if (attempt < maxRetries) {
           const backoff = 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
+          // Hold ALL same-host requests during the backoff window so a queued
+          // request doesn't fire while we're backing off (which would defeat
+          // the retry). coolHost sets b.cooldownUntil; waitForBucket honors it.
+          coolHost(host, Date.now() + backoff);
           await sleep(backoff);
           attempt++;
           continue;
@@ -257,6 +285,9 @@ export async function httpGet(url, opts = {}) {
         try { if (res.body) await res.body.dump(); } catch { /* ignore */ }
         const retryAfter = parseRetryAfter(res.headers?.["retry-after"]);
         const backoff = retryAfter ?? 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
+        // Hold same-host requests through the backoff (esp. Retry-After, which
+        // can be many seconds). coolHost is a no-op if backoff is ~0.
+        coolHost(host, Date.now() + backoff);
         await sleep(backoff);
         attempt++;
         continue;
