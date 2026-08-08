@@ -2,3 +2,6 @@ node_modules/
 *.log
 debug-*.html
 .mcp.json.local
+cache/
+docs/*.svg
+_fix_readme.py

@@ -1,4 +1,4 @@
-// deep_research: multi-engine fan-out → dedup → rank → fetch top → markdown report.
+// deep_research: multi-engine fan-out → dedup → RRF rank → fetch top → markdown report.
 
 import {
   ENGINES,
@@ -7,10 +7,19 @@ import {
   resolveBaiduRedirect,
 } from "./engines.js";
 import { fetchUrl } from "./fetcher.js";
+import { resultFingerprint, hamming64 } from "./simhash.js";
 
 const MAX_PARALLEL_FETCH = 4;
 
+// RRF (Reciprocal Rank Fusion) constant. k=60 is the established default
+// (Cormack et al. 2009; ranx.fuse, Carrara et al. CIKM 2022). Higher k
+// dampens the advantage of top ranks, making fusion robust to engines that
+// return very different result counts.
+const RRF_K = 60;
+
 // Run multiple engines concurrently, tolerating individual failures.
+// Returns each engine's results WITHIN-engine rank (1-based) so callers can
+// compute Reciprocal Rank Fusion across engines.
 async function runEngines(query, engineKeys, numPerEngine, log) {
   const engines = engineKeys
     .map((k) => ENGINES[k])
@@ -18,7 +27,9 @@ async function runEngines(query, engineKeys, numPerEngine, log) {
   const settled = await Promise.allSettled(
     engines.map(async (e) => {
       const results = await e.search(query, { num: numPerEngine });
-      return { engine: e.name, label: e.label, results };
+      // Tag each result with its (1-based) rank within this engine.
+      const ranked = results.map((r, i) => ({ ...r, rank: i + 1 }));
+      return { engine: e.name, label: e.label, results: ranked };
     }),
   );
   const ok = [];
@@ -43,36 +54,75 @@ function normUrl(u) {
   }
 }
 
+// Two-stage dedup: (1) exact normalized-URL merge, then (2) SimHash
+// near-duplicate merge on title+snippet to collapse syndicated copies that
+// live under different URLs. Threshold 3 bits is standard for short texts.
+const SIMHASH_THRESHOLD = 3;
+
 function dedupe(results) {
-  const seen = new Map();
+  // Stage 1: exact URL merge.
+  const byUrl = new Map();
   for (const r of results) {
     const key = normUrl(r.url);
     if (!key) continue;
-    const existing = seen.get(key);
+    const existing = byUrl.get(key);
     if (existing) {
-      // Merge: keep longest snippet, accumulate engine sources.
       if ((r.snippet || "").length > (existing.snippet || "").length) {
         existing.snippet = r.snippet;
       }
       if (!existing.sources.includes(r.engine)) existing.sources.push(r.engine);
+      // Track per-engine ranks for RRF.
+      if (!existing.ranks[r.engine]) existing.ranks[r.engine] = r.rank;
       continue;
     }
-    seen.set(key, { ...r, sources: [r.engine] });
+    byUrl.set(key, { ...r, sources: [r.engine], ranks: { [r.engine]: r.rank } });
   }
-  return [...seen.values()];
+  let deduped = [...byUrl.values()];
+
+  // Stage 2: SimHash near-duplicate merge.
+  for (const r of deduped) r.fp = resultFingerprint(r);
+  const merged = [];
+  const used = new Array(deduped.length).fill(false);
+  for (let i = 0; i < deduped.length; i++) {
+    if (used[i]) continue;
+    const base = deduped[i];
+    for (let j = i + 1; j < deduped.length; j++) {
+      if (used[j]) continue;
+      const cand = deduped[j];
+      if (hamming64(base.fp, cand.fp) <= SIMHASH_THRESHOLD) {
+        // Merge cand into base: keep longest snippet, union sources/ranks.
+        if ((cand.snippet || "").length > (base.snippet || "").length) {
+          base.snippet = cand.snippet;
+        }
+        for (const e of cand.sources) if (!base.sources.includes(e)) base.sources.push(e);
+        for (const [eng, rk] of Object.entries(cand.ranks)) {
+          if (!base.ranks[eng]) base.ranks[eng] = rk;
+        }
+        // Prefer the URL whose host looks like a primary source (no
+        // aggregator path like /search, /link, /ck/a) — heuristic.
+        if (looksAggregator(base.url) && !looksAggregator(cand.url)) {
+          base.url = cand.url;
+          base.title = cand.title || base.title;
+        }
+        used[j] = true;
+      }
+    }
+    merged.push(base);
+  }
+  return merged;
 }
 
-// Simple relevance score: query term coverage in title/snippet + multi-engine.
-function scoreResult(r, queryTerms) {
-  const title = (r.title || "").toLowerCase();
-  const snippet = (r.snippet || "").toLowerCase();
+function looksAggregator(url) {
+  return /\/(link|ck\/a|search|web|redirect)\b|baidu\.com\/link|bing\.com\/ck\/a/i.test(url || "");
+}
+
+// Reciprocal Rank Fusion: score = Σ_engine 1 / (k + rank_in_engine).
+// Robust without score normalization; standard for metasearch.
+function rrfScore(r) {
   let score = 0;
-  for (const t of queryTerms) {
-    if (!t) continue;
-    if (title.includes(t)) score += 3;
-    if (snippet.includes(t)) score += 1;
+  for (const rank of Object.values(r.ranks || {})) {
+    score += 1 / (RRF_K + rank);
   }
-  score += r.sources.length * 2; // appeared in multiple engines
   return score;
 }
 
@@ -125,7 +175,7 @@ export async function deepResearch(query, opts = {}) {
   log(`query="${query}" engines=[${engineKeys.join(",")}]`);
   const { ok, errors } = await runEngines(query, engineKeys, numPerEngine, log);
 
-  // Flatten + tag engine.
+  // Flatten + tag engine. Preserve within-engine rank from runEngines.
   const flat = [];
   for (const batch of ok) {
     for (const r of batch.results) {
@@ -134,11 +184,9 @@ export async function deepResearch(query, opts = {}) {
   }
   log(`raw results=${flat.length}`);
 
-  const deduped = dedupe(flat);
-  log(`deduped=${deduped.length}`);
-
-  // Resolve 百度 redirect links before scoring/fetch.
-  for (const r of deduped) {
+  // Resolve 百度 redirect links before dedup/scoring so cross-engine
+  // near-duplicates (e.g. a 百度 wrapped link and the same URL on Bing) merge.
+  for (const r of flat) {
     if (/baidu\.com\/link\?url=/.test(r.url)) {
       try {
         r.url = await resolveBaiduRedirect(r.url);
@@ -148,9 +196,24 @@ export async function deepResearch(query, opts = {}) {
     }
   }
 
-  const queryTerms = query.toLowerCase().split(/\s+/);
+  const deduped = dedupe(flat);
+  log(`deduped=${deduped.length}`);
+
+  // Rank via Reciprocal Rank Fusion across engines. As a tiebreaker, results
+  // that match query terms in the title get a small boost — this only orders
+  // results with near-equal RRF scores and never overrides cross-engine
+  // consensus.
+  const queryTerms = query.toLowerCase().split(/\s+/).filter(Boolean);
   const ranked = deduped
-    .map((r) => ({ ...r, score: scoreResult(r, queryTerms) }))
+    .map((r) => {
+      const score = rrfScore(r);
+      const title = (r.title || "").toLowerCase();
+      const termBoost = queryTerms.reduce(
+        (acc, t) => acc + (t && title.includes(t) ? 1e-4 : 0),
+        0,
+      );
+      return { ...r, score: score + termBoost, rrf: score };
+    })
     .sort((a, b) => b.score - a.score);
 
   const top = ranked.slice(0, fetchTopK);

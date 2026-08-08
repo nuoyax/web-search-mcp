@@ -15,6 +15,7 @@ import {
 } from "./src/engines.js";
 import { fetchUrl } from "./src/fetcher.js";
 import { deepResearch } from "./src/research.js";
+import { cacheGet, cacheSet, cacheKey, CACHE_ENABLED } from "./src/cache.js";
 
 const log = (...args) => process.stderr.write("[web-search] " + args.join(" ") + "\n");
 
@@ -51,6 +52,20 @@ server.tool(
       };
     }
 
+    // Cache lookup. Key excludes nothing user-visible; results from a given
+    // (query, num, engine) are stable enough to reuse across the TTL.
+    const key = cacheKey("web_search", { query, num, engine });
+    const cached = cacheGet(key);
+    if (cached) {
+      const ageMin = Math.round(cached.age / 60000);
+      log(`web_search cache HIT (age ${ageMin}min) for: ${query}`);
+      return {
+        content: [
+          { type: "text", text: `_cached (age ${ageMin}min, ttl ${Math.round(cached.ttl / 60000)}min)_\n\n${cached.value}` },
+        ],
+      };
+    }
+
     const settled = await Promise.allSettled(
       valid.map(async (k) => {
         const e = ENGINES[k];
@@ -73,6 +88,8 @@ server.tool(
     });
 
     const text = formatSearchResults(query, out, errs);
+    // Only cache when at least one engine returned results.
+    if (out.length) cacheSet(key, text, query);
     return { content: [{ type: "text", text }] };
   },
 );
@@ -111,6 +128,18 @@ server.tool(
   },
   async ({ url, max_chars }) => {
     try {
+      // Cache fetched pages by URL (+max_chars) with site-aware TTL.
+      const key = cacheKey("fetch_url", { url, max_chars });
+      const cached = cacheGet(key);
+      if (cached) {
+        const ageMin = Math.round(cached.age / 60000);
+        log(`fetch_url cache HIT (age ${ageMin}min) for: ${url}`);
+        return {
+          content: [
+            { type: "text", text: `_cached (age ${ageMin}min, ttl ${Math.round(cached.ttl / 60000)}min)_\n\n${cached.value}` },
+          ],
+        };
+      }
       const result = await fetchUrl(url, { maxChars: max_chars });
       if (!result.ok) {
         return {
@@ -121,11 +150,13 @@ server.tool(
       const header = [
         `# ${result.title || url}`,
         `URL: ${url}`,
-        `Status: ${result.status} | Proxy: ${result.useProxy ? "yes" : "no (direct)"}`,
+        `Status: ${result.status} | Proxy: ${result.useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`,
         "",
       ].join("\n");
+      const text = header + (result.markdown || "");
+      if (result.markdown) cacheSet(key, text, url);
       return {
-        content: [{ type: "text", text: header + (result.markdown || "") }],
+        content: [{ type: "text", text }],
       };
     } catch (e) {
       return {
@@ -152,6 +183,24 @@ server.tool(
   },
   async (args) => {
     try {
+      // Cache the synthesized report (cheap to serve; expensive to rebuild).
+      const key = cacheKey("deep_research", {
+        query: args.query,
+        engines: args.engines,
+        num_per_engine: args.num_per_engine,
+        fetch_top_k: args.fetch_top_k,
+        fetch_chars: args.fetch_chars,
+      });
+      const cached = cacheGet(key);
+      if (cached) {
+        const ageMin = Math.round(cached.age / 60000);
+        log(`deep_research cache HIT (age ${ageMin}min) for: ${args.query}`);
+        return {
+          content: [
+            { type: "text", text: `_cached (age ${ageMin}min, ttl ${Math.round(cached.ttl / 60000)}min)_\n\n${cached.value}` },
+          ],
+        };
+      }
       const result = await deepResearch(args.query, {
         engines: args.engines,
         numPerEngine: args.num_per_engine,
@@ -166,7 +215,9 @@ server.tool(
         result.errors.length ? `Engine errors: ${result.errors.map((e) => e.engine).join(", ")}` : "",
         "",
       ].filter(Boolean).join("\n");
-      return { content: [{ type: "text", text: header + "\n" + result.report }] };
+      const text = header + "\n" + result.report;
+      cacheSet(key, text, args.query);
+      return { content: [{ type: "text", text }] };
     } catch (e) {
       return {
         isError: true,

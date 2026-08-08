@@ -96,13 +96,108 @@ function routeFor(url, opts = {}) {
   return { parsed, dispatcher, useProxy };
 }
 
+// ---- Per-host politeness: token bucket + exponential backoff on retries ----
+// Limits concurrency and request rate per hostname so we don't trip
+// frequency-based anti-bot detection (consensus crawling-politeness policy,
+// e.g. BUbiNG §3.3; Cho & Garcia-Molina, "Effective Web Crawling").
+//
+// One bucket per host: max `capacity` in-flight, refilled to capacity after
+// `minIntervalMs` of host-idle. In practice we serialize per host (capacity=1)
+// plus a small inter-request delay, which is the safest default for scraping.
+
+const HOST_BUCKETS = new Map();
+
+function hostKey(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch { return url; }
+}
+
+function acquireBucket(host) {
+  let b = HOST_BUCKETS.get(host);
+  if (!b) {
+    b = {
+      queue: [],
+      active: 0,
+      lastReqAt: 0,
+    };
+    HOST_BUCKETS.set(host, b);
+  }
+  return b;
+}
+
+// Default politeness: 1 concurrent req per host, ≥120ms between requests to
+// the same host. Override per-call via opts.politeness.
+const DEFAULT_MAX_CONCURRENCY = 1;
+const DEFAULT_MIN_INTERVAL_MS = 120;
+
+function waitForBucket(host, opts) {
+  const b = acquireBucket(host);
+  const maxConc = opts.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+  const minInterval = opts.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
+
+  return new Promise((resolve) => {
+    const tryAcquire = () => {
+      const now = Date.now();
+      const sinceLast = now - b.lastReqAt;
+      const need = b.active >= maxConc ? false : sinceLast >= minInterval;
+      if (need) {
+        b.active++;
+        b.lastReqAt = now;
+        resolve();
+      } else {
+        // re-check when either a slot frees or the interval elapses.
+        const waitMs = Math.max(0, minInterval - sinceLast);
+        b.queue.push(tryAcquire);
+        if (b.active < maxConc) {
+          // idle waiting on interval; schedule a wake
+          setTimeout(() => {
+            const fn = b.queue.shift();
+            if (fn) fn();
+          }, waitMs);
+        }
+      }
+    };
+    tryAcquire();
+  });
+}
+
+function releaseBucket(host) {
+  const b = HOST_BUCKETS.get(host);
+  if (!b) return;
+  b.active = Math.max(0, b.active - 1);
+  const next = b.queue.shift();
+  if (next) next();
+}
+
+// Sleep helper that tolerates falsy ms.
+function sleep(ms) {
+  if (!ms || ms <= 0) return Promise.resolve();
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Parse a Retry-After header (seconds or HTTP-date). Returns ms or null.
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const n = Number(value);
+  if (!Number.isNaN(n)) return n * 1000;
+  const d = Date.parse(value);
+  if (!Number.isNaN(d)) return Math.max(0, d - Date.now());
+  return null;
+}
+
+// Statuses that signal "back off and retry" rather than a hard failure.
+function isTransient(status) {
+  return status === 429 || status === 503 || status === 502 || status === 504;
+}
+
 /**
- * Fetch a URL as text with auto proxy routing + redirect following.
+ * Fetch a URL as text with auto proxy routing + redirect following +
+ * per-host politeness (token bucket) + exponential backoff on transient
+ * errors (429/5xx).
  * @returns {Promise<{status:number, headers:object, text:string, url:string, useProxy:boolean}>}
  */
 export async function httpGet(url, opts = {}) {
-  const { parsed, dispatcher, useProxy } = routeFor(url, opts);
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxRetries = opts.retries ?? 2;
 
   const headers = {
     "User-Agent": opts.userAgent ?? DEFAULT_UA,
@@ -113,21 +208,53 @@ export async function httpGet(url, opts = {}) {
   };
   if (opts.referer) headers.Referer = opts.referer;
 
-  let currentUrl = parsed.href;
+  let currentUrl = url;
   let visited = new Set();
   let finalRes = null;
   const maxHops = opts.maxRedirections ?? 5;
 
   for (let hop = 0; hop <= maxHops; hop++) {
     const cur = new URL(currentUrl);
+    const host = cur.hostname.toLowerCase();
     const { dispatcher, useProxy } = routeFor(currentUrl, opts);
-    const res = await request(cur, {
-      method: "GET",
-      headers,
-      dispatcher,
-      headersTimeout: timeoutMs,
-      bodyTimeout: timeoutMs,
-    });
+
+    let res = null;
+    let attempt = 0;
+    // Retry loop with exponential backoff for transient statuses.
+    while (true) {
+      await waitForBucket(host, opts);
+      try {
+        res = await request(cur, {
+          method: "GET",
+          headers,
+          dispatcher,
+          headersTimeout: timeoutMs,
+          bodyTimeout: timeoutMs,
+        });
+      } catch (e) {
+        releaseBucket(host);
+        // Network errors (timeout/reset) are transient too.
+        if (attempt < maxRetries) {
+          const backoff = 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
+          await sleep(backoff);
+          attempt++;
+          continue;
+        }
+        throw e;
+      }
+      releaseBucket(host);
+
+      if (isTransient(res.statusCode) && attempt < maxRetries) {
+        // Drain before retrying.
+        try { if (res.body) await res.body.dump(); } catch { /* ignore */ }
+        const retryAfter = parseRetryAfter(res.headers?.["retry-after"]);
+        const backoff = retryAfter ?? 500 * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
+        await sleep(backoff);
+        attempt++;
+        continue;
+      }
+      break;
+    }
 
     const headerObj = {};
     for (const [k, v] of Object.entries(res.headers || {})) headerObj[k] = v;
