@@ -190,30 +190,38 @@ function parseBingResults(html, num) {
   return out;
 }
 
-// ---------- 百度 (direct) ----------
-async function searchBaidu(query, { num = 10 } = {}) {
-  const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${num}`;
-  const { text, status } = await httpGet(url, {
-    forceDirect: true,
-    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    headers: {
-      "Upgrade-Insecure-Requests": "1",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "none",
-      "Cache-Control": "max-age=0",
-    },
-    timeoutMs: 25_000,
-  });
-  if (status >= 400) throw new Error(`Baidu HTTP ${status}`);
+// Parse 百度 SERP HTML into results. Pure (no network) so it can be unit-tested
+// against CAPTCHA fixtures without hitting the network. Shared by the desktop
+// search path; throwing here surfaces engine failures (esp. CAPTCHA) so the
+// caller's Promise.allSettled marks 百度 as failed instead of silently
+// succeeding with 0 results (which would distort RRF/dedup/reports).
+export function parseBaiduResults(text, num) {
   const $ = cheerio.load(text);
-  const out = [];
-  // 百度 may serve a CAPTCHA interstitial when it suspects bots. Detect and bail.
-  if (/wappass\.百度\.com\/static\/captcha|wappass\.baidu\.com\/static\/captcha/i.test(text)) {
-    throw new Error("Baidu returned CAPTCHA interstitial (anti-spider)");
+
+  // 百度 serves several CAPTCHA/safety-verification interstitials when it
+  // suspects bots. All of them are 200 with a tiny body and 0 result nodes,
+  // which used to look like "succeeded with 0 results" — silently misleading.
+  // Detect and bail so the engine is reported as failed.
+  //
+  // Two-track detection to avoid false-positives on real SERPs:
+  //  (a) wappass.baidu.com URL — only ever present on CAPTCHA pages, so a
+  //      standalone match is authoritative.
+  //  (b) The newer "百度安全验证" page — the string alone can appear in a real
+  //      result snippet, so require ALL of: 0 result nodes AND a tiny body
+  //      (<4KB). A real SERP — even one with 0 matches for an obscure query —
+  //      is a full page (nav/footer/related) well over 10KB; only the
+  //      interstitial is ~1.4KB.
+  const isCaptcha =
+    /wappass\.(baidu|百度)\.com\/static\/captcha/i.test(text) ||
+    /百度安全验证|安全验证|wappass\.baidu\.com/i.test(text);
+  const resultNodes = $(".result.c-container, .c-container");
+  if (isCaptcha && (resultNodes.length === 0 || text.length < 4000)) {
+    throw new Error("Baidu returned CAPTCHA/safety-verification interstitial (anti-spider)");
   }
+
   // 百度 results: .result / .c-container
-  $(".result.c-container, .c-container").each((_, el) => {
+  const out = [];
+  resultNodes.each((_, el) => {
     if (out.length >= num) return false;
     const a = $(el).find("h3 a").first();
     const title = a.text().trim();
@@ -230,6 +238,25 @@ async function searchBaidu(query, { num = 10 } = {}) {
     if (title && href) out.push({ title, url: href, snippet, needsBaiduRedirect: !mu });
   });
   return out;
+}
+
+// ---------- 百度 (direct) ----------
+async function searchBaidu(query, { num = 10 } = {}) {
+  const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=${num}`;
+  const { text, status } = await httpGet(url, {
+    forceDirect: true,
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    headers: {
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Cache-Control": "max-age=0",
+    },
+    timeoutMs: 25_000,
+  });
+  if (status >= 400) throw new Error(`Baidu HTTP ${status}`);
+  return parseBaiduResults(text, num);
 }
 
 // ---------- 搜狗 (direct) ----------
