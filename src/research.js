@@ -4,7 +4,7 @@ import {
   ENGINES,
   ENGINE_LIST,
   defaultEngineOrder,
-  resolveBaiduRedirect,
+  resolveBaiduRedirects,
   faviconImg,
   sourcesLabel,
 } from "./engines.js";
@@ -186,17 +186,12 @@ export async function deepResearch(query, opts = {}) {
   }
   log(`raw results=${flat.length}`);
 
-  // Resolve 百度 redirect links before dedup/scoring so cross-engine
-  // near-duplicates (e.g. a 百度 wrapped link and the same URL on Bing) merge.
-  for (const r of flat) {
-    if (/baidu\.com\/link\?url=/.test(r.url)) {
-      try {
-        r.url = await resolveBaiduRedirect(r.url);
-      } catch {
-        /* keep original */
-      }
-    }
-  }
+  // Resolve 百度 redirect links in parallel before dedup/scoring so
+  // cross-engine near-duplicates (e.g. a 百度 wrapped link and the same URL on
+  // Bing) merge. Parallel (capped 4) — the per-host token bucket still paces
+  // the actual HTTP, so this pipelines the await chain without raising the
+  // request rate baidu sees.
+  await resolveBaiduRedirects(flat);
 
   const deduped = dedupe(flat);
   log(`deduped=${deduped.length}`);

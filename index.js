@@ -11,7 +11,7 @@ import {
   ENGINES,
   ENGINE_LIST,
   defaultEngineOrder,
-  resolveBaiduRedirect,
+  resolveBaiduRedirects,
   faviconImg,
   sourcesLabel,
 } from "./src/engines.js";
@@ -72,12 +72,10 @@ server.tool(
       valid.map(async (k) => {
         const e = ENGINES[k];
         const results = await e.search(query, { num });
-        // Resolve baidu redirects in results so links are usable.
-        for (const r of results) {
-          if (/baidu\.com\/link\?url=/.test(r.url)) {
-            try { r.url = await resolveBaiduRedirect(r.url); } catch { /* keep */ }
-          }
-        }
+        // Resolve baidu redirect links in parallel so 8 wrapped links resolve
+        // in ~1s (concurrency-capped) instead of ~3.4s serial. The per-host
+        // token bucket still paces the actual HTTP — no extra anti-bot risk.
+        await resolveBaiduRedirects(results);
         return { engine: k, label: e.label, favicon: e.favicon, results };
       }),
     );
