@@ -12,6 +12,8 @@ import {
   ENGINE_LIST,
   defaultEngineOrder,
   resolveBaiduRedirect,
+  faviconImg,
+  sourcesLabel,
 } from "./src/engines.js";
 import { fetchUrl } from "./src/fetcher.js";
 import { deepResearch } from "./src/research.js";
@@ -76,7 +78,7 @@ server.tool(
             try { r.url = await resolveBaiduRedirect(r.url); } catch { /* keep */ }
           }
         }
-        return { engine: k, label: e.label, results };
+        return { engine: k, label: e.label, favicon: e.favicon, results };
       }),
     );
 
@@ -103,9 +105,13 @@ function formatSearchResults(query, batches, errors) {
   // Per-result source tag so the data origin of every link is explicit.
   let idx = 1;
   for (const b of batches) {
-    if (batches.length > 1) lines.push(`## ${b.label} (${b.results.length})`);
+    if (batches.length > 1) {
+      const img = b.favicon ? faviconImg(b.engine, b.label) : "";
+      lines.push(`## ${img} ${b.label} (${b.results.length})`.trim());
+    }
     for (const r of b.results) {
-      const src = ` [source: ${b.label}]`;
+      // Inline favicon + label so each result shows its engine logo.
+      const src = b.favicon ? ` ${faviconImg(b.engine, b.label)} [source: ${b.label}]` : ` [source: ${b.label}]`;
       lines.push(`${idx}. [${r.title || r.url}](${r.url})${src}`);
       if (r.snippet) lines.push(`   ${r.snippet.replace(/\s+/g, " ").slice(0, 240)}`);
       idx++;
@@ -117,7 +123,8 @@ function formatSearchResults(query, batches, errors) {
   lines.push(`## Data sources`);
   lines.push(`Retrieved from ${batches.length} engine(s), ${totalResults} result(s) total:`);
   for (const b of batches) {
-    lines.push(`- **${b.label}** — ${b.results.length} result(s)`);
+    const img = b.favicon ? faviconImg(b.engine, b.label) + " " : "";
+    lines.push(`- ${img}**${b.label}** — ${b.results.length} result(s)`);
   }
   if (errors.length) {
     lines.push("");

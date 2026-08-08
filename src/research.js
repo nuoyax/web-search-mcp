@@ -5,6 +5,8 @@ import {
   ENGINE_LIST,
   defaultEngineOrder,
   resolveBaiduRedirect,
+  faviconImg,
+  sourcesLabel,
 } from "./engines.js";
 import { fetchUrl } from "./fetcher.js";
 import { resultFingerprint, hamming64 } from "./simhash.js";
@@ -29,7 +31,7 @@ async function runEngines(query, engineKeys, numPerEngine, log) {
       const results = await e.search(query, { num: numPerEngine });
       // Tag each result with its (1-based) rank within this engine.
       const ranked = results.map((r, i) => ({ ...r, rank: i + 1 }));
-      return { engine: e.name, label: e.label, results: ranked };
+      return { engine: e.name, label: e.label, favicon: e.favicon, results: ranked };
     }),
   );
   const ok = [];
@@ -302,7 +304,7 @@ function composeReport({ query, engines, engineErrors, ranked, fetched }) {
   // All results list. Each item tagged with its originating engine(s).
   lines.push("## Sources");
   ranked.slice(0, 15).forEach((r, i) => {
-    const src = r.sources && r.sources.length ? ` [source: ${r.sources.join(", ")}]` : "";
+    const src = r.sources && r.sources.length ? ` ${sourcesLabel(r.sources)} [source: ${r.sources.join(", ")}]` : "";
     lines.push(`${i + 1}. [${r.title || r.url}](${r.url})${src}`);
     if (r.snippet) lines.push(`   ${r.snippet.replace(/\n+/g, " ").slice(0, 240)}`);
   });
@@ -311,7 +313,7 @@ function composeReport({ query, engines, engineErrors, ranked, fetched }) {
   // Detailed fetched content (truncated). Each block labeled with its source.
   lines.push("## Fetched content");
   for (const f of fetched.filter((x) => x.ok && x.markdown)) {
-    const srcLabel = f.sources && f.sources.length ? ` (source: ${f.sources.join(", ")})` : "";
+    const srcLabel = f.sources && f.sources.length ? ` ${sourcesLabel(f.sources)} (source: ${f.sources.join(", ")})` : "";
     lines.push(`### ${f.title || f.url}${srcLabel}`);
     lines.push(`URL: ${f.url}`);
     lines.push("");
@@ -334,7 +336,10 @@ function composeReport({ query, engines, engineErrors, ranked, fetched }) {
   for (const eng of engines) {
     const cnt = byEngine.get(eng) ?? 0;
     const failed = engineErrors.some((e) => e.engine === eng);
-    lines.push(`- **${eng}** — ${cnt} result(s)${failed ? " (failed)" : ""}`);
+    const img = faviconImg(eng, ENGINES[eng]?.label || eng);
+    const prefix = img ? `${img} ` : "";
+    const label = ENGINES[eng]?.label || eng;
+    lines.push(`- ${prefix}**${label}** — ${cnt} result(s)${failed ? " (failed)" : ""}`);
   }
   const fetchedOk = fetched.filter((f) => f.ok).length;
   lines.push("");

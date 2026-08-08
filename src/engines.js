@@ -10,41 +10,73 @@ export const ENGINES = {
     name: "duckduckgo",
     label: "DuckDuckGo",
     international: true,
+    favicon: "https://duckduckgo.com/favicon.ico",
     search: searchDuckDuckGo,
   },
   bing: {
     name: "bing",
     label: "Bing (International)",
     international: true,
+    favicon: "https://www.bing.com/favicon.ico",
     search: searchBingIntl,
   },
   baidu: {
     name: "baidu",
     label: "百度",
     international: false,
+    favicon: "https://www.baidu.com/favicon.ico",
     search: searchBaidu,
   },
   sogou: {
     name: "sogou",
     label: "搜狗",
     international: false,
+    favicon: "https://www.sogou.com/favicon.ico",
     search: searchSogou,
   },
   so: {
     name: "so",
     label: "360搜索",
     international: false,
+    favicon: "https://www.so.com/favicon.ico",
     search: searchSo,
   },
   bingcn: {
     name: "bingcn",
     label: "Bing 中国版",
     international: false,
+    favicon: "https://cn.bing.com/favicon.ico",
     search: searchBingCN,
   },
 };
 
 export const ENGINE_LIST = Object.values(ENGINES);
+
+// Render an engine favicon as inline markdown image, sized for inline display.
+// Favicon ICOs are small; renders as a 1em icon in markdown viewers that
+// respect the width attribute, and as raw `![label](url)` text in terminals
+// (where images can't be displayed, so the label reads as the engine name).
+export function faviconImg(name, label) {
+  const e = ENGINES[name];
+  if (!e || !e.favicon) return "";
+  const alt = label || e.label || name;
+  return `![${alt}](${e.favicon})`;
+}
+
+// Resolve a list of engine names to a compact "logo + label" string, e.g.
+// "![DuckDuckGo](...) DuckDuckGo" or for multiple: "🦆DuckDuckGo, 百度".
+// Used in [source: …] tags and the data-sources summary.
+export function sourcesLabel(names) {
+  const list = (names || []).filter(Boolean);
+  if (!list.length) return "";
+  return list
+    .map((n) => {
+      const e = ENGINES[n];
+      const img = e?.favicon ? faviconImg(n, e.label) : "";
+      return e ? `${img} ${e.label}` : n;
+    })
+    .join(", ");
+}
 
 function isCjk(query) {
   // If the query contains CJK characters, treat as CN-oriented.
