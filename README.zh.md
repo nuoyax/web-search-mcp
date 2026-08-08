@@ -61,6 +61,29 @@ node index.js          # 启动 MCP server（stdio）
 node test-smoke.js     # 各引擎 + fetch 冒烟测试
 ```
 
+### （建议）禁用 Claude Code 内置 `WebFetch`
+
+Claude Code 自带一个内置 `WebFetch` 工具，它走 claude.ai 服务端的域名安全校验来抓取。在受限网络下会报 `Unable to verify if domain … is safe to fetch … blocking claude.ai`，且无法用你的代理。本 server 的 `fetch_url` 已经走 `127.0.0.1:7890`（403 还会 TLS 伪装），所以建议禁用内置那个，让 Claude 总是用 `fetch_url`。
+
+在 `~/.claude/settings.json`（全局，所有项目）的 `permissions.deny` 里加 `WebFetch`：
+
+```jsonc
+{
+  "permissions": {
+    "deny": ["WebFetch"]
+    // 若想用 web_search 完全替代，也可加 "WebSearch"
+  }
+}
+```
+
+或仅对当前项目——`D:\agents\web_search\.claude\settings.local.json`（已 gitignore）：
+
+```jsonc
+{ "permissions": { "deny": ["WebFetch"] } }
+```
+
+`deny` 规则跨 user → project → local 层叠加，且在 `bypassPermissions` 模式下仍生效。改完重启 Claude Code。用 `/permissions` 验证。
+
 ---
 
 ## 特性

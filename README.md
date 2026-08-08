@@ -61,6 +61,29 @@ node index.js          # start the MCP server (stdio)
 node test-smoke.js     # smoke test every engine + fetch
 ```
 
+### (Recommended) Disable Claude Code's built-in `WebFetch`
+
+Claude Code ships a built-in `WebFetch` tool that fetches via claude.ai's server-side domain-safety check. On a restricted network it errors with `Unable to verify if domain … is safe to fetch … blocking claude.ai`, and it can't use your proxy. Since this server's `fetch_url` already fetches through `127.0.0.1:7890` (and TLS-impersonates on 403), disable the built-in one so Claude always uses `fetch_url`.
+
+Add `WebFetch` to `permissions.deny` in `~/.claude/settings.json` (global, all projects):
+
+```jsonc
+{
+  "permissions": {
+    "deny": ["WebFetch"]
+    // also common: "WebSearch" if you want web_search to fully replace it
+  }
+}
+```
+
+Or, project-only — `D:\agents\web_search\.claude\settings.local.json` (gitignored):
+
+```jsonc
+{ "permissions": { "deny": ["WebFetch"] } }
+```
+
+`deny` rules stack across the user → project → local layers and are honored even in `bypassPermissions` mode. Restart Claude Code after editing. Verify with `/permissions`.
+
 ---
 
 ## Highlights
