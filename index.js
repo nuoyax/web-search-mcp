@@ -15,7 +15,7 @@ import {
 } from "./src/engines.js";
 import { fetchUrl } from "./src/fetcher.js";
 import { deepResearch } from "./src/research.js";
-import { cacheGet, cacheSet, cacheKey, CACHE_ENABLED } from "./src/cache.js";
+import { cacheGet, cacheGetStale, cacheSet, cacheKey, CACHE_ENABLED } from "./src/cache.js";
 
 const log = (...args) => process.stderr.write("[web-search] " + args.join(" ") + "\n");
 
@@ -88,7 +88,6 @@ server.tool(
     });
 
     const text = formatSearchResults(query, out, errs);
-    // Only cache when at least one engine returned results.
     if (out.length) cacheSet(key, text, query);
     return { content: [{ type: "text", text }] };
   },
@@ -130,34 +129,49 @@ server.tool(
     try {
       // Cache fetched pages by URL (+max_chars) with site-aware TTL.
       const key = cacheKey("fetch_url", { url, max_chars });
-      const cached = cacheGet(key);
-      if (cached) {
-        const ageMin = Math.round(cached.age / 60000);
+      const fresh = cacheGet(key);
+
+      // Fresh hit: serve immediately.
+      if (fresh) {
+        const ageMin = Math.round(fresh.age / 60000);
         log(`fetch_url cache HIT (age ${ageMin}min) for: ${url}`);
         return {
           content: [
-            { type: "text", text: `_cached (age ${ageMin}min, ttl ${Math.round(cached.ttl / 60000)}min)_\n\n${cached.value}` },
+            { type: "text", text: `_cached (age ${ageMin}min, ttl ${Math.round(fresh.ttl / 60000)}min)_\n\n${fresh.value}` },
           ],
         };
       }
-      const result = await fetchUrl(url, { maxChars: max_chars });
-      if (!result.ok) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Fetch failed: ${result.error || "HTTP " + result.status} for ${url}` }],
-        };
+
+      // Stale-but-validators: drive a conditional revalidation
+      // (If-None-Match / If-Modified-Since). On 304 we reuse the cached body
+      // and refresh TTL; on a fresh 200 we replace the entry with new validators.
+      const stale = cacheGetStale(key);
+      if (stale && stale.value && (stale.etag || stale.lastModified)) {
+        const { title, useProxy, markdown } = parseCachedFetch(stale.value);
+        const result = await fetchUrl(url, {
+          maxChars: max_chars,
+          validators: { etag: stale.etag, lastModified: stale.lastModified },
+          cachedBody: { title, useProxy, markdown },
+        });
+        if (result.notModified) {
+          const ageMin = Math.round(stale.age / 60000);
+          log(`fetch_url 304 NOT MODIFIED (reuse body, age ${ageMin}min) for: ${url}`);
+          // Body unchanged; refresh TTL + validators.
+          cacheSet(key, stale.value, url, result.validators);
+          const header = [
+            `# ${title || url}`,
+            `URL: ${url}`,
+            `Status: 304 (revalidated) | Proxy: ${useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`,
+            "",
+          ].join("\n");
+          return { content: [{ type: "text", text: header + markdown }] };
+        }
+        // Fresh 200 (or fallback) — replace cache + format normally.
+        return finishFetch(result, url, key);
       }
-      const header = [
-        `# ${result.title || url}`,
-        `URL: ${url}`,
-        `Status: ${result.status} | Proxy: ${result.useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`,
-        "",
-      ].join("\n");
-      const text = header + (result.markdown || "");
-      if (result.markdown) cacheSet(key, text, url);
-      return {
-        content: [{ type: "text", text }],
-      };
+
+      const result = await fetchUrl(url, { maxChars: max_chars });
+      return finishFetch(result, url, key);
     } catch (e) {
       return {
         isError: true,
@@ -166,6 +180,43 @@ server.tool(
     }
   },
 );
+
+// Shared finish path: format + cache a (possibly failed) fetch result.
+function finishFetch(result, url, key) {
+  if (!result.ok) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: `Fetch failed: ${result.error || "HTTP " + result.status} for ${url}` }],
+    };
+  }
+  const header = [
+    `# ${result.title || url}`,
+    `URL: ${url}`,
+    `Status: ${result.status} | Proxy: ${result.useProxy ? "yes" : "no (direct)"} | TLS: ${result.impersonated ? "impersonated (curl_cffi)" : "native (undici)"}`,
+    "",
+  ].join("\n");
+  const text = header + (result.markdown || "");
+  if (result.markdown) cacheSet(key, text, url, result.validators);
+  return { content: [{ type: "text", text }] };
+}
+
+// Recover the title/useProxy/body from a cached fetch_url text blob. The
+// cached blob is exactly what we return to the client (header + markdown),
+// so we re-parse the prefix lines we wrote.
+function parseCachedFetch(text) {
+  const lines = (text || "").split("\n");
+  let title = "";
+  let useProxy = false;
+  let bodyStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.startsWith("# ")) title = l.slice(2).trim();
+    else if (l.startsWith("Status:") && /Proxy:\s*yes/.test(l)) useProxy = true;
+    if (l === "") { bodyStart = i + 1; break; }
+  }
+  const markdown = lines.slice(bodyStart).join("\n");
+  return { title, useProxy, markdown };
+}
 
 // ---- deep_research ----
 server.tool(

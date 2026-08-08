@@ -1,23 +1,26 @@
-// curl_cffi bridge: TLS/JA3 fingerprint spoofing fallback.
+// curl_cffi bridge: TLS/JA3 + HTTP/2 fingerprint spoofing fallback.
 //
-// Node's undici uses a non-browser TLS ClientHello, so heavily-protected
-// sites (Cloudflare-protected docs, Baidu CAPTCHA) sometimes return 403 /
-// interstitials. curl_cffi (Python) can impersonate a real browser's TLS
-// fingerprint (JA3/JA4) + HTTP/2 settings, defeating such checks.
+// Node's undici uses a non-browser TLS ClientHello AND a non-browser HTTP/2
+// settings frame. Modern anti-bot stacks (Cloudflare, Akamai) fingerprint
+// BOTH — JA3/JA4 over the ClientHello and H2 settings over SETTINGS /
+// WINDOW_UPDATE. curl_cffi's `impersonate: "chrome"` aligns the two jointly,
+// which is why it succeeds where undici gets 403.
 //
-// We spawn a short-lived Python process per call. For higher throughput one
-// would run a persistent bridge server, but per-request spawning is simpler
-// and fine for the volumes an MCP server sees.
+// To avoid a wasted "doomed undici probe" (a request that is certain to 403
+// and that itself is a suspicious signal), hard-case hosts listed below go
+// STRAIGHT to curl_cffi via needsImpersonation() — fetchUrl never tries
+// undici on them first.
 //
-// Ref: "TLS Beyond the Browser" (ACM IMC 2019) — non-browser TLS clients are
-// fingerprintable; impersonation closes that gap.
+// Ref: "TLS Beyond the Browser" (ACM IMC 2019, 10.1145/3355369.3355601) —
+// non-browser TLS clients are fingerprintable; H2 fingerprinting is the
+// modern complement (Akamai H2 fingerprinting, industry consensus).
 
 import { spawn } from "node:child_process";
 import { PROXY_URL, isDirectHost } from "./http.js";
 
-// Sites known to need TLS impersonation (403 / interstitial on plain undici).
-// We don't hard-restrict to this list — fetchUrl decides when to fall back —
-// but we keep it so callers can short-circuit straight to curl_cffi.
+// Sites known to need TLS+H2 impersonation (403 / interstitial on plain
+// undici). Add aggressively-protected hosts here to skip the doomed undici
+// probe entirely. Plain undici is still the fast path for everything else.
 const HARDCASE_HOSTS = [
   "docs.anthropic.com",
   "platform.claude.com",

@@ -208,6 +208,14 @@ export async function httpGet(url, opts = {}) {
   };
   if (opts.referer) headers.Referer = opts.referer;
 
+  // Conditional revalidation (RFC 9111 §4.3.4). When the caller passes stored
+  // validators from a stale cache entry, send them so the origin can answer
+  // 304 Not Modified — we then reuse the cached body instead of refetching.
+  if (opts.validators) {
+    if (opts.validators.etag) headers["If-None-Match"] = opts.validators.etag;
+    if (opts.validators.lastModified) headers["If-Modified-Since"] = opts.validators.lastModified;
+  }
+
   let currentUrl = url;
   let visited = new Set();
   let finalRes = null;
@@ -293,12 +301,15 @@ export async function httpGet(url, opts = {}) {
       url: currentUrl,
       useProxy,
       contentType: headerObj["content-type"] || "",
+      // 304 Not Modified: the cached representation is still fresh. Body is
+      // empty by spec; the caller (fetcher.js) reuses its cached body.
+      notModified: status === 304,
     };
     break;
   }
 
   if (!finalRes) {
-    finalRes = { status: 0, headers: {}, text: "", url: currentUrl, useProxy: false, contentType: "" };
+    finalRes = { status: 0, headers: {}, text: "", url: currentUrl, useProxy: false, contentType: "", notModified: false };
   }
   return finalRes;
 }

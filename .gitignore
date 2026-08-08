@@ -3,8 +3,10 @@ node_modules/
 debug-*.html
 .mcp.json.local
 cache/
-docs/*.svg
+docs/
+tests/
 _fix_readme.py
+_shot.js
 
 # AI OS 工作区状态：绝不提交
 CLAUDE.md

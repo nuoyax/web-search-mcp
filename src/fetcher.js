@@ -48,30 +48,58 @@ function htmlToMarkdown(text, url, contentType, useProxy, maxChars) {
  * Fetch a URL and return cleaned-up markdown + metadata.
  * Strategy: undici first (fast, native). On 403/blocked, or for sites known
  * to require browser TLS fingerprinting, retry via curl_cffi impersonation.
+ *
+ * Conditional revalidation: pass {cachedBody, validators} in opts. When the
+ * cached entry is stale the caller sends the stored ETag/Last-Modified; if
+ * the origin returns 304 we reuse `cachedBody` and report notModified=true so
+ * the cache entry can be refreshed (TTL bumped) without re-parsing.
+ *
  * @param {string} url
- * @param {object} opts { maxChars?: number }
+ * @param {object} opts { maxChars?: number, validators?: {etag,lastModified}, cachedBody?: {title,markdown,useProxy} }
  */
 export async function fetchUrl(url, opts = {}) {
   const maxChars = opts.maxChars ?? 16_000;
+  const { validators } = opts;
 
   // Fast path: undici unless this host is known to need impersonation.
   if (!needsImpersonation(url)) {
     try {
-      const { text, status, contentType, useProxy } = await httpGet(url, {
+      const { text, status, contentType, useProxy, notModified, headers } = await httpGet(url, {
         accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         timeoutMs: 25_000,
         maxRedirections: 5,
+        validators,
       });
 
+      // 304 Not Modified: cached representation is still valid. Reuse the
+      // cached body and surface validators so the caller can refresh TTL.
+      if (notModified && opts.cachedBody) {
+        const cb = opts.cachedBody;
+        const markdown = cb.markdown.length > maxChars
+          ? cb.markdown.slice(0, maxChars) + "\n\n...[truncated]"
+          : cb.markdown;
+        return {
+          ok: true,
+          status: 304,
+          url,
+          title: cb.title || "",
+          markdown,
+          useProxy: cb.useProxy ?? false,
+          notModified: true,
+          validators: pickValidators(headers),
+        };
+      }
+
       if (status < 400) {
-        return { status, ...htmlToMarkdown(text, url, contentType, useProxy, maxChars) };
+        const md = htmlToMarkdown(text, url, contentType, useProxy, maxChars);
+        return { status, ...md, notModified: false, validators: pickValidators(headers) };
       }
 
       // 403 / 429 → try impersonation fallback (if available).
       if ((status === 403 || status === 429) && (await curlAvailable())) {
         const imp = await curlFetch(url, opts);
         if (imp.ok && imp.status != null && imp.status < 400) {
-          return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars) };
+          return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars), notModified: false, validators: pickValidators(imp.headers) };
         }
         // curl_cffi also got blocked — report the impersonated status so the
         // caller sees the real (non-undici) response code, not "HTTP 403" from undici.
@@ -86,7 +114,7 @@ export async function fetchUrl(url, opts = {}) {
       if (await curlAvailable()) {
         const imp = await curlFetch(url, opts);
         if (imp.ok && imp.status < 400) {
-          return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars) };
+          return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars), notModified: false, validators: pickValidators(imp.headers) };
         }
       }
       throw e;
@@ -97,17 +125,37 @@ export async function fetchUrl(url, opts = {}) {
   if (await curlAvailable()) {
     const imp = await curlFetch(url, opts);
     if (imp.ok && imp.status < 400) {
-      return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars) };
+      // curl_cffi returns 304 only if it followed a conditional request; we
+      // don't pass validators to curl_cffi, so treat any success as a fresh 200.
+      return { status: imp.status, impersonated: true, ...htmlToMarkdown(imp.text, url, imp.headers?.["content-type"] || "text/html", true, maxChars), notModified: false, validators: pickValidators(imp.headers) };
     }
     return { ok: false, status: imp.status || 0, url, error: imp.error || "curl_cffi failed", markdown: "" };
   }
 
   // curl_cffi not installed: best-effort undici attempt anyway.
-  const { text, status, contentType, useProxy } = await httpGet(url, {
+  const { text, status, contentType, useProxy, headers } = await httpGet(url, {
     accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     timeoutMs: 25_000,
     maxRedirections: 5,
+    validators,
   });
   if (status >= 400) return { ok: false, status, url, error: `HTTP ${status} (curl_cffi not installed for impersonation)`, markdown: "" };
-  return { status, ...htmlToMarkdown(text, url, contentType, useProxy, maxChars) };
+  const md = htmlToMarkdown(text, url, contentType, useProxy, maxChars);
+  return { status, ...md, notModified: status === 304, validators: pickValidators(headers) };
+}
+
+// Extract cacheable validators from a response's headers. We store ETag and
+// Last-Modified so a later expired read can revalidate cheaply (304 reuse).
+function pickValidators(headers) {
+  if (!headers) return undefined;
+  const get = (k) => {
+    const v = headers[k] ?? headers[k.toLowerCase()];
+    return Array.isArray(v) ? v[0] : v;
+  };
+  const etag = get("etag");
+  const lastModified = get("last-modified");
+  const v = {};
+  if (etag) v.etag = etag;
+  if (lastModified) v.lastModified = lastModified;
+  return Object.keys(v).length ? v : undefined;
 }
