@@ -88,7 +88,7 @@ Claude Code 自带一个内置 `WebFetch` 工具，它走 claude.ai 服务端的
 
 ## 特性
 
-- **6 引擎** — DuckDuckGo / Bing（国际，走代理）+ Bing 中国版 / 百度 / 搜狗 / 360（直连）。按查询语言自动选择。
+- **8 引擎** — DuckDuckGo / Brave / Wikipedia / Bing（国际，走代理）+ Bing 中国版 / 百度 / 搜狗 / 360（直连）。按查询语言自动选择。
 - **3 工具** — `web_search`、`fetch_url`、`deep_research`（多引擎扇出 → 去重 → 排序 → 抓取 → 带引用报告）
 - **代理自动路由** — 国内主机直连，国际主机走 `127.0.0.1:7890`；重定向时逐跳重新判定。
 - **RRF 融合排序**（`k=60`）跨引擎 —— 无需分数归一化，鲁棒。
@@ -113,7 +113,7 @@ flowchart TB
     end
 
     subgraph Core["核心层"]
-        Eng["engines.js\n6 个引擎适配器"]
+        Eng["engines.js\n8 个引擎适配器"]
         Fetch["fetcher.js\nHTML → markdown\n+ TLS 降级调度"]
         Res["research.js\nRRF 融合 + SimHash 去重"]
     end
@@ -234,6 +234,8 @@ flowchart TB
 | 引擎 | 区域 | 路由 | 说明 |
 |---|---|---|---|
 | duckduckgo | 国际 | 走代理 | `html.duckduckgo.com/html/` 免 key HTML 端点 |
+| brave | 国际 | 走代理 | `search.brave.com` |
+| wikipedia | 国际 | 走代理 | `en.wikipedia.org` 搜索 API |
 | bing | 国际 | 走代理 | `setmkt=en-US&cc=US`，从 `<cite>` 还原真实 URL（绕过 `ck/a` 跳转包装） |
 | bingcn | 国内 | 直连 | `cn.bing.com` |
 | baidu | 国内 | 直连 | 检测验证码页报错，`mu` 属性取真实 URL |
@@ -342,7 +344,7 @@ web-search-mcp/
 ├── index.js              # MCP server 入口（注册 3 工具，stdio）
 ├── src/
 │   ├── http.js           # HTTP 层 + 代理路由 + 令牌桶 + 退避
-│   ├── engines.js        # 6 引擎适配
+│   ├── engines.js        # 8 引擎适配
 │   ├── fetcher.js        # HTML→markdown + TLS 降级调度
 │   ├── research.js       # RRF 融合 + SimHash 去重流水线
 │   ├── simhash.js        # 64-bit Charikar SimHash

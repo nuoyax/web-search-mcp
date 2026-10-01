@@ -88,7 +88,7 @@ Or, project-only — `D:\agents\web_search\.claude\settings.local.json` (gitigno
 
 ## Highlights
 
-- **6 engines** — DuckDuckGo / Bing (international, via proxy) + Bing CN / Baidu / Sogou / 360 (direct). Auto-selected by query language.
+- **8 engines** — DuckDuckGo / Brave / Wikipedia / Bing (international, via proxy) + Bing CN / Baidu / Sogou / 360 (direct). Auto-selected by query language.
 - **3 tools** — `web_search`, `fetch_url`, `deep_research` (multi-engine fan-out → dedup → rank → fetch → cited report)
 - **Auto proxy routing** — CN hosts go direct, international hosts go through `127.0.0.1:7890`; re-decided per redirect hop.
 - **RRF rank fusion** (`k=60`) across engines — robust without score normalization.
@@ -113,7 +113,7 @@ flowchart TB
     end
 
     subgraph Core["Core layer"]
-        Eng["engines.js\n6 engine adapters"]
+        Eng["engines.js\n8 engine adapters"]
         Fetch["fetcher.js\nHTML → markdown\n+ TLS fallback dispatch"]
         Res["research.js\nRRF fusion + SimHash dedup"]
     end
@@ -234,6 +234,8 @@ Strategy:
 | Engine | Region | Route | Notes |
 |---|---|---|---|
 | duckduckgo | international | proxy | `html.duckduckgo.com/html/` no-key HTML endpoint |
+| brave | international | proxy | `search.brave.com` |
+| wikipedia | international | proxy | `en.wikipedia.org` search API |
 | bing | international | proxy | `setmkt=en-US&cc=US`; reconstructs real URL from `<cite>` (bypasses the `ck/a` redirect wrapper) |
 | bingcn | CN | direct | `cn.bing.com` |
 | baidu | CN | direct | Detects CAPTCHA interstitial and errors out; reads `mu` attr for the real URL |
@@ -343,7 +345,7 @@ web-search-mcp/
 ├── index.js              # MCP server entry (registers 3 tools, stdio)
 ├── src/
 │   ├── http.js           # HTTP layer + proxy routing + token bucket + backoff
-│   ├── engines.js        # 6 engine adapters
+│   ├── engines.js        # 8 engine adapters
 │   ├── fetcher.js        # HTML → markdown + TLS fallback dispatch
 │   ├── research.js       # RRF fusion + SimHash dedup pipeline
 │   ├── simhash.js        # 64-bit Charikar SimHash
